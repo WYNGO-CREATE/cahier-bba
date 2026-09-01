@@ -826,7 +826,10 @@ function enregistrerConfig({ fournisseur, cle, modele }){
       const k = S_CLE[IA.fournisseur];
       IA.cles[IA.fournisseur] ? localStorage.setItem(k, IA.cles[IA.fournisseur]) : localStorage.removeItem(k);
     }
-    if(modele !== undefined && modele){ IA.modele = modele; localStorage.setItem(S_MODELE, modele); }
+    if(modele !== undefined && modele){
+      IA.modele = modele; localStorage.setItem(S_MODELE, modele);
+      reintegrerModele(modele);   // un choix explicite lève une exclusion passée
+    }
   }catch(e){}
   majMode();
 }
@@ -895,11 +898,30 @@ async function listerModeles(cle){
   return (j.data||[]).map(m=>m.id);
 }
 
-/* Choisit le meilleur modèle disponible : rapide, multimodal, récent. */
-function choisirModele(noms){
-  const utiles = (noms||[]).filter(n=>!/embed|aqa|imagen|veo|tts|audio|live|-image|gemma/i.test(n));
-  if(!utiles.length) return "";
-  const version = n=>{ const m = n.match(/(\d+)[.\-](\d+)/); return m ? parseFloat(m[1]+"."+m[2]) : 0; };
+/* Modèles écartés parce qu'ils ont réellement échoué à l'usage — le catalogue
+   d'un fournisseur annonce parfois des modèles qui refusent ensuite l'appel. */
+const S_EXCLUS = LS_KEY + "-modeles-exclus";
+function lireExclus(){
+  try{ return new Set(JSON.parse(localStorage.getItem(S_EXCLUS) || "[]")); }catch(e){ return new Set(); }
+}
+function exclureModele(n){
+  if(!n) return;
+  const s = lireExclus(); s.add(n);
+  try{ localStorage.setItem(S_EXCLUS, JSON.stringify([...s])); }catch(e){}
+}
+function reintegrerModele(n){
+  const s = lireExclus(); if(!s.delete(n)) return;
+  try{ localStorage.setItem(S_EXCLUS, JSON.stringify([...s])); }catch(e){}
+}
+
+/* Classe les modèles disponibles : rapide, multimodal, récent — en écartant
+   ceux qui se sont déjà montrés inutilisables. Renvoie la liste ordonnée. */
+function classerModeles(noms){
+  const exclus = lireExclus();
+  const utiles = (noms||[]).filter(n=>!/embed|aqa|imagen|veo|tts|audio|live|-image|gemma/i.test(n) && !exclus.has(n));
+  if(!utiles.length) return [];
+  // « gemini-3-flash » → 3 ; « gemini-2.5-flash » → 2.5 ; « claude-opus-4-8 » → 4.8
+  const version = n=>{ const m = n.match(/(\d+)(?:[.\-](\d+))?/); return m ? parseFloat(m[1] + "." + (m[2]||"0")) : 0; };
   const score = n=>{
     let s = version(n) * 10;
     if(/flash/i.test(n)) s += 30;          // rapide et économique : idéal pour l'OCR au quotidien
@@ -909,17 +931,33 @@ function choisirModele(noms){
     if(/preview|exp|latest/i.test(n)) s -= 5;   // on préfère les versions stables
     return s;
   };
-  return utiles.slice().sort((a,b)=>score(b)-score(a))[0];
+  return utiles.slice().sort((a,b)=>score(b)-score(a));
 }
+function choisirModele(noms){ return classerModeles(noms)[0] || ""; }
 
-/* Réparation silencieuse quand le modèle enregistré n'existe pas (ou plus). */
+/* Réparation quand le modèle enregistré n'existe pas, ou refuse cette API :
+   on écarte le fautif et on prend le suivant du classement. */
 async function reparerModele(){
   try{
+    exclureModele(IA.modele);
     const choix = choisirModele(await listerModeles());
     if(!choix || choix === IA.modele) return false;
     enregistrerConfig({ modele: choix });
     return true;
   }catch(e){ return false; }
+}
+
+/* Vérifie par l'usage qu'un modèle répond vraiment — le catalogue ne suffit pas. */
+async function validerModele(nom){
+  const avant = IA.modele;
+  IA.modele = nom;
+  try{
+    await appelAPI({ messages:[{ role:"user", content:"Réponds exactement : OK" }], maxTokens: 32, effort:"low" }, true);
+    return true;
+  }catch(e){
+    if(e && (e.code === "modele_inconnu" || e.code === "invalid_request")){ exclureModele(nom); return false; }
+    IA.modele = avant; throw e;   // clé invalide, quota… : ce n'est pas le modèle
+  }
 }
 
 /* ---------- Gemini : conversion du schéma JSON vers le format Google ---------- */
@@ -940,12 +978,13 @@ function versSchemaGemini(s){
 }
 
 /* ---------- appel Gemini, en flux ---------- */
-async function appelGemini(o, dejaRepare){
+async function appelGemini(o, essais){
+  essais = essais || 0;
   try{
     return await appelGeminiBrut(o);
   }catch(e){
-    if(e && e.code === "modele_inconnu" && !dejaRepare && await reparerModele()){
-      return appelGemini(o, true);
+    if(e && e.code === "modele_inconnu" && essais < 4 && await reparerModele()){
+      return appelGemini(o, essais + 1);
     }
     throw e;
   }
@@ -992,9 +1031,13 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
     else if(/has not been used|is disabled|SERVICE_DISABLED/i.test(msg)) msg += " — l'API Generative Language n'est pas activée sur ce projet Google.";
     else if(/referer|referrer|API_KEY_HTTP_REFERRER/i.test(msg)) msg += " — la clé est restreinte à certains sites ; retire la restriction, ou autorise wyngo-create.github.io.";
     const err = new Error(msg || ("HTTP "+res.status));
-    err.code = res.status === 400 && /API key/i.test(msg) ? "cle_invalide"
+    // « only supports Interactions API », « not supported for generateContent » :
+    // le catalogue annonce le modèle, mais il refuse cette API. C'est un problème
+    // de modèle, pas de clé — on l'écarte et on prend le suivant.
+    const modeleRefuse = /only supports|not supported for|is not supported|does not support/i.test(msg);
+    err.code = res.status === 404 || modeleRefuse ? "modele_inconnu"
+             : res.status === 400 && /API key/i.test(msg) ? "cle_invalide"
              : res.status === 403 ? "cle_invalide"
-             : res.status === 404 ? "modele_inconnu"
              : res.status === 429 ? "rate_limited"
              : res.status >= 500 ? "upstream_error" : "api_error";
     throw err;
@@ -1028,12 +1071,15 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
 }
 
 /* ---------- appel Anthropic, en flux ---------- */
-async function appelAPI(o, dejaRepare){
-  if(IA.fournisseur === "gemini") return appelGemini(o);
+/* `sansReparation` : utilisé par validerModele(), qui teste un modèle précis et
+   doit voir l'échec brut — sinon la réparation automatique basculerait sur un
+   autre modèle et la validation croirait avoir réussi. */
+async function appelAPI(o, sansReparation){
+  if(IA.fournisseur === "gemini") return appelGemini(o, sansReparation ? 99 : 0);
   try{
     return await appelAnthropic(o);
   }catch(e){
-    if(e && e.code === "modele_inconnu" && !dejaRepare && await reparerModele()){
+    if(e && e.code === "modele_inconnu" && !sansReparation && await reparerModele()){
       return appelAPI(o, true);
     }
     throw e;
@@ -1824,15 +1870,28 @@ function openSettings(){
       enregistrerConfig({ cle: $("#sKey").value, modele: $("#sModele").value.trim() });
       if(!cleActive()){ closeModal(); openSettings(); return; }
       btn.disabled = true;
-      out.innerHTML = '<span class="thinking"><i></i>Vérification de la clé et choix du modèle…</span>';
+      out.innerHTML = '<span class="thinking"><i></i>Vérification de la clé…</span>';
       try{
         const noms = await listerModeles();
-        const choix = choisirModele(noms);
-        if(choix && noms.indexOf(IA.modele) < 0) enregistrerConfig({ modele: choix });
+        const candidats = classerModeles(noms);
+        if(!candidats.length) throw Object.assign(new Error("aucun modèle utilisable"), { code:"modele_inconnu" });
+
+        // On ne se fie pas au catalogue : chaque candidat est essayé pour de vrai,
+        // dans l'ordre, jusqu'à ce qu'un réponde.
+        let retenu = "", ecartes = 0;
+        for(const n of candidats.slice(0,5)){
+          out.innerHTML = '<span class="thinking"><i></i>Essai de '+esc(n)+"…</span>";
+          if(await validerModele(n)){ retenu = n; break; }
+          ecartes++;
+        }
+        if(!retenu) throw Object.assign(new Error("aucun modèle n'a répondu"), { code:"modele_inconnu" });
+
+        enregistrerConfig({ modele: retenu });
         closeModal(); openSettings();
         const o2 = $("#sKeyOut");
-        if(o2) o2.innerHTML = '<b style="color:var(--ok)">Clé valide.</b> Modèle retenu : <b>'+esc(IA.modele)+"</b> — "
-          + noms.length + " modèle(s) accessibles avec ta clé.";
+        if(o2) o2.innerHTML = '<b style="color:var(--ok)">Tout est prêt.</b> Modèle retenu : <b>'+esc(retenu)+"</b>"
+          + (ecartes ? " (" + ecartes + " modèle(s) écarté(s) parce qu'ils refusaient l'appel)" : "")
+          + ". Tu peux importer tes photos.";
       }catch(e){
         out.innerHTML = '<b style="color:var(--alert)">'+esc(msgErreur(e))+"</b>";
         btn.disabled = false;
