@@ -955,6 +955,81 @@ async function reparerModele(){
   }catch(e){ return false; }
 }
 
+/* Rapport de diagnostic partageable. Ne contient jamais la clé : seulement
+   sa longueur, pour distinguer « absente » de « tronquée à la copie ». */
+async function diagnostic(progres){
+  const L = [], dire = t=>{ L.push(t); if(progres) progres(L.join("\n")); };
+  const cle = cleActive();
+
+  dire("=== Diagnostic — Cahier BBA ===");
+  dire("Fournisseur : " + FOURNISSEURS[IA.fournisseur].nom);
+  dire("Clé : " + (cle ? "présente, " + cle.length + " caractères" : "ABSENTE"));
+  dire("Modèle enregistré : " + (IA.modele || "aucun"));
+  const ex = [...lireExclus()];
+  dire("Modèles déjà écartés : " + (ex.length ? ex.join(", ") : "aucun"));
+  dire("");
+
+  if(!cle){ dire("→ Rien à tester sans clé."); return L.join("\n"); }
+
+  let noms = [];
+  try{
+    noms = await listerModeles();
+    dire("Catalogue : " + noms.length + " modèle(s) annoncés compatibles.");
+  }catch(e){
+    dire("Catalogue : ÉCHEC — " + (e.message || e.code));
+    dire("");
+    dire("→ La clé est refusée avant même le choix d'un modèle.");
+    return L.join("\n");
+  }
+
+  const candidats = classerModeles(noms).slice(0, 6);
+  dire("Essais réels (le catalogue ne suffit pas) :");
+  let bon = "";
+  for(const n of candidats){
+    const avant = IA.modele;
+    IA.modele = n;
+    try{
+      await appelAPI({ messages:[{ role:"user", content:"Réponds exactement : OK" }], maxTokens:32, effort:"low" }, true);
+      dire("  [OK] " + n + " — répond");
+      if(!bon) bon = n;
+    }catch(e){
+      dire("  [X] " + n + " — " + (e.message || e.code));
+    }
+    IA.modele = avant;
+  }
+  dire("");
+
+  if(!bon){ dire("→ Aucun modèle ne répond avec cette clé."); return L.join("\n"); }
+
+  const avant = IA.modele;
+  IA.modele = bon;
+  try{
+    const c = document.createElement("canvas");
+    c.width = 420; c.height = 140;
+    const g = c.getContext("2d");
+    g.fillStyle = "#fff"; g.fillRect(0,0,c.width,c.height);
+    g.fillStyle = "#000"; g.font = "bold 64px Georgia, serif";
+    g.fillText("ESSEC 2026", 20, 92);
+    const d = c.toDataURL("image/jpeg", 0.9);
+    const t = await appelAPI({
+      messages:[{ role:"user", content:"Quel texte est écrit sur cette image ? Réponds uniquement par ce texte." }],
+      images:[{ media:"image/jpeg", b64: d.slice(d.indexOf(",")+1) }],
+      maxTokens:200, effort:"low"
+    }, true);
+    dire(/ESSEC/i.test(t) ? "Lecture d'image : [OK] réussie (« " + t.trim().slice(0,40) + " »)"
+                          : "Lecture d'image : réponse inattendue — « " + t.trim().slice(0,80) + " »");
+    dire("");
+    dire("→ Modèle opérationnel : " + bon);
+    enregistrerConfig({ modele: bon });
+  }catch(e){
+    dire("Lecture d'image : ÉCHEC — " + (e.message || e.code));
+    dire("");
+    dire("→ Le texte fonctionne, mais pas les images sur ce modèle.");
+    IA.modele = avant;
+  }
+  return L.join("\n");
+}
+
 /* Vérifie par l'usage qu'un modèle répond vraiment — le catalogue ne suffit pas. */
 async function validerModele(nom){
   const avant = IA.modele;
@@ -1854,8 +1929,12 @@ function openSettings(){
           + '<button class="btn sm" id="sModList" style="white-space:nowrap">Lister</button></div>'
           + '<p class="note" id="sModOut" style="margin-top:6px">« Lister » interroge le fournisseur pour afficher les modèles réellement disponibles avec ta clé.</p></div>'
           + '<div class="doc-actions" style="margin-top:12px"><button class="btn sm pri" id="sKeySave">Enregistrer</button>'
-          + '<button class="btn sm" id="sKeyTest">Tester la lecture d\'une photo</button></div>'
+          + '<button class="btn sm" id="sKeyTest">Diagnostic complet</button></div>'
           + '<p class="note" id="sKeyOut" style="margin-top:8px"></p>'
+          + '<pre id="sDiag" class="hide" style="margin-top:10px;background:var(--surface-2);border:1px solid var(--line);'
+          + 'border-radius:8px;padding:10px 12px;font-size:11.5px;line-height:1.5;overflow-x:auto;white-space:pre-wrap"></pre>'
+          + '<div class="doc-actions hide" id="sDiagActions"><button class="btn sm" id="sDiagCopy">Copier le rapport</button>'
+          + '<span class="note" id="sDiagCopied"></span></div>'
         : '<p class="note" style="margin-top:10px">Cette page est servie par Claude : elle n\'a pas accès au réseau, donc aucune clé API ne peut être utilisée ici. '
           + 'Pour l\'OCR photo, ouvre la version hébergée du fichier.</p>')
     + "</div>"
@@ -1922,33 +2001,30 @@ function openSettings(){
     };
 
     $("#sKeyTest").onclick = async ()=>{
-      const out = $("#sKeyOut"), btn = $("#sKeyTest");
+      const out = $("#sKeyOut"), btn = $("#sKeyTest"), pre = $("#sDiag"), act = $("#sDiagActions");
       enregistrerConfig({ cle: $("#sKey").value, modele: $("#sModele").value.trim() });
-      if(!cleActive()){ out.textContent = "Enregistre d'abord une clé."; return; }
       btn.disabled = true;
-      out.innerHTML = '<span class="thinking"><i></i>Test en cours — une image est générée puis envoyée…</span>';
+      out.innerHTML = '<span class="thinking"><i></i>Diagnostic en cours…</span>';
+      pre.classList.remove("hide");
+      let rapport = "";
       try{
-        // Image de test : le mot ESSEC dessiné dans un canvas, puis relu par l'IA.
-        const c = document.createElement("canvas");
-        c.width = 420; c.height = 140;
-        const g = c.getContext("2d");
-        g.fillStyle = "#fff"; g.fillRect(0,0,c.width,c.height);
-        g.fillStyle = "#000"; g.font = "bold 64px Georgia, serif";
-        g.fillText("ESSEC 2026", 20, 92);
-        const data = c.toDataURL("image/jpeg", 0.9);
-        const t = await appelAPI({
-          messages: [{ role:"user", content:"Quel texte est écrit sur cette image ? Réponds uniquement par ce texte." }],
-          images: [{ media:"image/jpeg", b64: data.slice(data.indexOf(",")+1) }],
-          effort: "low", maxTokens: 200
-        });
-        const ok = /ESSEC/i.test(t);
-        out.innerHTML = ok
-          ? '<b style="color:var(--ok)">Lecture des photos confirmée.</b> L\'IA a bien lu « '+esc(t.trim().slice(0,40))+' ». L\'import photo est opérationnel.'
-          : '<b style="color:var(--warn)">Réponse inattendue :</b> '+esc(t.trim().slice(0,120));
+        rapport = await diagnostic(t=>{ pre.textContent = t; });
       }catch(e){
-        out.innerHTML = '<b style="color:var(--alert)">Échec :</b> '+esc(msgErreur(e));
+        rapport = (pre.textContent||"") + "\nErreur inattendue : " + (e.message || e.code || e);
       }
+      pre.textContent = rapport;
+      out.innerHTML = "Rapport ci-dessous. Il ne contient pas ta clé — tu peux le copier et me l'envoyer tel quel.";
+      act.classList.remove("hide");
+      $("#sDiagCopy").onclick = async ()=>{
+        try{ await navigator.clipboard.writeText(rapport); $("#sDiagCopied").textContent = "copié"; }
+        catch(e){
+          const r = document.createRange(); r.selectNodeContents(pre);
+          const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+          $("#sDiagCopied").textContent = "sélectionné — fais Cmd+C";
+        }
+      };
       btn.disabled = false;
+      $("#sModele").value = IA.modele;
     };
   }
   $("#sExport").onclick = ()=>{
