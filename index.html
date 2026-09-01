@@ -872,6 +872,51 @@ function imageEnBase64(file){
   });
 }
 
+/* ---------- découverte des modèles : ne jamais dépendre d'un nom figé ---------- */
+async function listerModeles(cle){
+  cle = cle || cleActive();
+  if(IA.fournisseur === "gemini"){
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", { headers:{ "x-goog-api-key": cle } });
+    if(!r.ok) throw Object.assign(new Error("HTTP "+r.status), { code: (r.status===403||r.status===400) ? "cle_invalide" : "api_error" });
+    const j = await r.json();
+    return (j.models||[])
+      .filter(m=>(m.supportedGenerationMethods||[]).indexOf("generateContent") >= 0)
+      .map(m=>String(m.name).replace(/^models\//,""));
+  }
+  const r = await fetch("https://api.anthropic.com/v1/models?limit=100", {
+    headers:{ "x-api-key": cle, "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" } });
+  if(!r.ok) throw Object.assign(new Error("HTTP "+r.status), { code: r.status===401?"cle_invalide":"api_error" });
+  const j = await r.json();
+  return (j.data||[]).map(m=>m.id);
+}
+
+/* Choisit le meilleur modèle disponible : rapide, multimodal, récent. */
+function choisirModele(noms){
+  const utiles = (noms||[]).filter(n=>!/embed|aqa|imagen|veo|tts|audio|live|-image|gemma/i.test(n));
+  if(!utiles.length) return "";
+  const version = n=>{ const m = n.match(/(\d+)[.\-](\d+)/); return m ? parseFloat(m[1]+"."+m[2]) : 0; };
+  const score = n=>{
+    let s = version(n) * 10;
+    if(/flash/i.test(n)) s += 30;          // rapide et économique : idéal pour l'OCR au quotidien
+    else if(/sonnet|pro/i.test(n)) s += 20;
+    if(/opus/i.test(n)) s += 25;
+    if(/lite/i.test(n)) s -= 15;
+    if(/preview|exp|latest/i.test(n)) s -= 5;   // on préfère les versions stables
+    return s;
+  };
+  return utiles.slice().sort((a,b)=>score(b)-score(a))[0];
+}
+
+/* Réparation silencieuse quand le modèle enregistré n'existe pas (ou plus). */
+async function reparerModele(){
+  try{
+    const choix = choisirModele(await listerModeles());
+    if(!choix || choix === IA.modele) return false;
+    enregistrerConfig({ modele: choix });
+    return true;
+  }catch(e){ return false; }
+}
+
 /* ---------- Gemini : conversion du schéma JSON vers le format Google ---------- */
 function versSchemaGemini(s){
   if(!s || typeof s !== "object") return s;
@@ -890,7 +935,18 @@ function versSchemaGemini(s){
 }
 
 /* ---------- appel Gemini, en flux ---------- */
-async function appelGemini({ system, messages, images, maxTokens, schema, onText, signal }){
+async function appelGemini(o, dejaRepare){
+  try{
+    return await appelGeminiBrut(o);
+  }catch(e){
+    if(e && e.code === "modele_inconnu" && !dejaRepare && await reparerModele()){
+      return appelGemini(o, true);
+    }
+    throw e;
+  }
+}
+
+async function appelGeminiBrut({ system, messages, images, maxTokens, schema, onText, signal }){
   const parts = [];
   for(const im of (images||[])) parts.push({ inline_data:{ mime_type: im.media, data: im.b64 } });
 
@@ -960,8 +1016,19 @@ async function appelGemini({ system, messages, images, maxTokens, schema, onText
 }
 
 /* ---------- appel Anthropic, en flux ---------- */
-async function appelAPI({ system, messages, images, effort, maxTokens, schema, onText, signal }){
-  if(IA.fournisseur === "gemini") return appelGemini({ system, messages, images, maxTokens, schema, onText, signal });
+async function appelAPI(o, dejaRepare){
+  if(IA.fournisseur === "gemini") return appelGemini(o);
+  try{
+    return await appelAnthropic(o);
+  }catch(e){
+    if(e && e.code === "modele_inconnu" && !dejaRepare && await reparerModele()){
+      return appelAPI(o, true);
+    }
+    throw e;
+  }
+}
+
+async function appelAnthropic({ system, messages, images, effort, maxTokens, schema, onText, signal }){
   const contenu = [];
   for(const im of (images||[])) contenu.push({ type:"image", source:{ type:"base64", media_type: im.media, data: im.b64 } });
 
@@ -998,7 +1065,9 @@ async function appelAPI({ system, messages, images, effort, maxTokens, schema, o
     try{ const j = await res.json(); detail = (j.error && j.error.message) || ""; }catch(e){}
     const err = new Error(detail || ("HTTP " + res.status));
     err.code = res.status === 401 ? "cle_invalide"
+             : res.status === 404 ? "modele_inconnu"
              : res.status === 429 ? "rate_limited"
+             : res.status === 400 && /model/i.test(detail) ? "modele_inconnu"
              : res.status === 400 ? "invalid_request"
              : res.status >= 500 ? "upstream_error" : "api_error";
     throw err;
@@ -1244,7 +1313,7 @@ async function envoyerChat(skipInput){
 function msgErreur(e){
   const c = e && e.code;
   if(c==="cle_invalide") return "Clé API refusée. Vérifie-la sur " + FOURNISSEURS[IA.fournisseur].lienCle + ".";
-  if(c==="modele_inconnu") return "Ce modèle n'existe pas pour ta clé. Clique « Lister » dans les réglages pour voir ceux qui sont disponibles.";
+  if(c==="modele_inconnu") return "Aucun modèle utilisable trouvé pour cette clé. Vérifie qu'elle est bien active sur " + FOURNISSEURS[IA.fournisseur].lienCle + ".";
   if(c==="api_error") return "L'API a refusé la requête" + (e.message ? " : "+e.message : ".");
   if(c==="not_granted" || c==="sampling_disabled") return "L'assistant n'est pas configuré — voir ⚙ Réglages.";
   if(c==="rate_limited") return "Trop de demandes d'affilée — réessaie dans quelques minutes.";
@@ -1737,10 +1806,24 @@ function openSettings(){
       closeModal(); openSettings();
     });
 
-    $("#sKeySave").onclick = ()=>{
+    $("#sKeySave").onclick = async ()=>{
+      const btn = $("#sKeySave"), out = $("#sKeyOut");
       enregistrerConfig({ cle: $("#sKey").value, modele: $("#sModele").value.trim() });
-      closeModal(); openSettings();
-      const o = $("#sKeyOut"); if(o) o.textContent = cleActive() ? "Enregistré." : "Clé retirée.";
+      if(!cleActive()){ closeModal(); openSettings(); return; }
+      btn.disabled = true;
+      out.innerHTML = '<span class="thinking"><i></i>Vérification de la clé et choix du modèle…</span>';
+      try{
+        const noms = await listerModeles();
+        const choix = choisirModele(noms);
+        if(choix && noms.indexOf(IA.modele) < 0) enregistrerConfig({ modele: choix });
+        closeModal(); openSettings();
+        const o2 = $("#sKeyOut");
+        if(o2) o2.innerHTML = '<b style="color:var(--ok)">Clé valide.</b> Modèle retenu : <b>'+esc(IA.modele)+"</b> — "
+          + noms.length + " modèle(s) accessibles avec ta clé.";
+      }catch(e){
+        out.innerHTML = '<b style="color:var(--alert)">'+esc(msgErreur(e))+"</b>";
+        btn.disabled = false;
+      }
     };
 
     $("#sModList").onclick = async ()=>{
@@ -1748,23 +1831,7 @@ function openSettings(){
       if(!$("#sKey").value.trim()){ out.textContent = "Colle d'abord ta clé, puis relance « Lister »."; return; }
       btn.disabled = true; out.innerHTML = '<span class="thinking"><i></i>Interrogation du fournisseur…</span>';
       try{
-        const cle = $("#sKey").value.trim();
-        let noms = [];
-        if(IA.fournisseur === "gemini"){
-          const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models", { headers:{ "x-goog-api-key": cle } });
-          if(!r.ok) throw Object.assign(new Error("HTTP "+r.status), { code: r.status===403?"cle_invalide":"api_error" });
-          const j = await r.json();
-          noms = (j.models||[])
-            .filter(m=>(m.supportedGenerationMethods||[]).indexOf("generateContent") >= 0)
-            .map(m=>String(m.name).replace(/^models\//,""))
-            .filter(n=>!/embed|aqa|imagen|veo/i.test(n));
-        }else{
-          const r = await fetch("https://api.anthropic.com/v1/models?limit=100", {
-            headers:{ "x-api-key": cle, "anthropic-version":"2023-06-01", "anthropic-dangerous-direct-browser-access":"true" } });
-          if(!r.ok) throw Object.assign(new Error("HTTP "+r.status), { code: r.status===401?"cle_invalide":"api_error" });
-          const j = await r.json();
-          noms = (j.data||[]).map(m=>m.id);
-        }
+        const noms = await listerModeles($("#sKey").value.trim());
         if(!noms.length){ out.textContent = "Aucun modèle renvoyé pour cette clé."; btn.disabled=false; return; }
         out.innerHTML = '<span class="note">Clique un modèle pour le choisir :</span><span class="chap-meta" style="margin-top:6px">'
           + noms.slice(0,24).map(n=>'<button type="button" class="pill type" data-mod="'+esc(n)+'" style="cursor:pointer;border:1px solid var(--line-2)">'+esc(n)+"</button>").join("")
