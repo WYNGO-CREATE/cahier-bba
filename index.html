@@ -304,6 +304,10 @@
   .card h4{font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--texte-3);
     font-weight:650;margin-bottom:9px}
   .note{font-size:13px;color:var(--texte-2);line-height:1.5}
+  .avertit{background:var(--attention-doux);color:var(--attention);border:1px solid var(--attention);
+    border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.5;margin-bottom:12px;font-weight:500}
+  .prose a{color:var(--accent);text-decoration:underline;text-underline-offset:2px}
+  .etiq.apercu{background:var(--attention-doux);color:var(--attention)}
 
   /* menu de création */
   .creation-liste{display:flex;flex-direction:column;gap:8px}
@@ -438,6 +442,7 @@ const state = {
 };
 
 const TYPES = {
+  apercu:   "Aperçu du programme",
   cours:    "Cours",
   td:       "TD / Séance",
   exercice: "Exercices",
@@ -562,6 +567,8 @@ function md(src){
   let out = [], i = 0, listType = null;
 
   const inline = t => esc(t)
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      (m,txt,url)=>'<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+txt+"</a>")
     .replace(/\$\$([^$]+)\$\$/g, (m,x)=>"<code>"+x.trim()+"</code>")
     .replace(/\$([^$\n]+)\$/g, (m,x)=>"<code>"+x.trim()+"</code>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -932,7 +939,7 @@ async function appelGemini(o, essais){
   }
 }
 
-async function appelGeminiBrut({ system, messages, images, maxTokens, schema, onText, signal }){
+async function appelGeminiBrut({ system, messages, images, maxTokens, schema, onText, signal, recherche, sources }){
   const parts = [];
   for(const im of (images||[])) parts.push({ inline_data:{ mime_type: im.media, data: im.b64 } });
 
@@ -948,7 +955,10 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
     generationConfig: { maxOutputTokens: maxTokens || 8192 }
   };
   if(system) body.systemInstruction = { parts:[{ text: system }] };
-  if(schema){
+  // La recherche web et le schéma JSON s'excluent chez Google : quand on
+  // veut des sources, on accepte du texte libre et on cite en fin de réponse.
+  if(recherche) body.tools = [{ google_search: {} }];
+  else if(schema){
     body.generationConfig.responseMimeType = "application/json";
     body.generationConfig.responseSchema = versSchemaGemini(schema);
   }
@@ -1003,6 +1013,14 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
       if(cand.finishReason) fin = cand.finishReason;
       const ps = (cand.content && cand.content.parts) || [];
       for(const p of ps) if(typeof p.text === "string"){ texte += p.text; if(onText) onText(texte); }
+      // Sources d'ancrage : ce qui rend la réponse contrôlable.
+      const gm = cand.groundingMetadata;
+      if(sources && gm && gm.groundingChunks){
+        for(const g of gm.groundingChunks){
+          const w = g && g.web;
+          if(w && w.uri && !sources.some(s=>s.url === w.uri)) sources.push({ url:w.uri, titre:w.title || w.uri });
+        }
+      }
     }
   }
 
@@ -1018,6 +1036,9 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
    autre modèle et la validation croirait avoir réussi. */
 async function appelAPI(o, sansReparation){
   if(IA.fournisseur === "gemini") return appelGemini(o, sansReparation ? 99 : 0);
+  // La recherche web n'est pas encore câblée côté Anthropic : on génère sans
+  // ancrage plutôt que d'échouer, et l'interface le dit franchement.
+  if(o && o.recherche) o = { ...o, recherche:false };
   try{
     return await appelAnthropic(o);
   }catch(e){
@@ -1113,12 +1134,12 @@ function normaliser(messages){
 }
 
 async function iaTexte(opts){
-  const { system, images, effort, maxTokens, onText } = opts;
+  const { system, images, effort, maxTokens, onText, recherche, sources } = opts;
   const messages = normaliser(opts.messages);
   if(IA.mode === "api"){
     const imgs = [];
     for(const f of (images||[])) imgs.push(await imageEnBase64(f));
-    return appelAPI({ system, messages, images:imgs, effort, maxTokens, onText });
+    return appelAPI({ system, messages, images:imgs, effort, maxTokens, onText, recherche, sources });
   }
   if(IA.mode === "artifact"){
     const turns = system ? [{ role:"user", content:system }].concat(messages) : messages.slice();
@@ -1755,6 +1776,189 @@ function afficherResultats(docs, mid){
   };
 }
 
+/* =========================================================
+   PROGRAMME — le squelette du semestre
+   Le syllabus du prof devient la liste des chapitres. Chaque chapitre
+   peut ensuite recevoir un aperçu généré, ancré dans des sources que
+   l'étudiant peut ouvrir et vérifier lui-même.
+   ========================================================= */
+const SCHEMA_PROGRAMME = {
+  type:"object",
+  properties:{
+    chapitres:{ type:"array", items:{
+      type:"object",
+      properties:{
+        numero:{type:"integer"},
+        titre:{type:"string"},
+        objectifs:{type:"array", items:{type:"string"}},
+        notions:{type:"array", items:{type:"string"}},
+        periode:{type:"string"}
+      },
+      required:["numero","titre","objectifs","notions","periode"],
+      additionalProperties:false }}
+  },
+  required:["chapitres"],
+  additionalProperties:false
+};
+
+function openProgramme(mid){
+  mid = mid || state.selMat;
+  if(!state.matieres.length){ openMatieresModal(); return; }
+
+  modal('<div class="modal-head"><h2>Programme du semestre</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><div class="stack">'
+    + '<div><label class="lab" for="pgM">Matière</label><select class="field" id="pgM">'
+    +   state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===mid?" selected":"")+">"+esc(m.nom)+"</option>").join("")
+    + "</select></div>"
+    + '<div><label class="lab" for="pgTxt">Colle ici le programme donné par ton prof</label>'
+    +   '<textarea class="field" id="pgTxt" rows="10" placeholder="Plan du cours, liste des séances, thèmes, dates… tel que tu l\'as reçu. Le format n\'a pas d\'importance."></textarea>'
+    +   '<p class="note" style="margin-top:8px">Chaque élément deviendra un chapitre de ta matière. Tes chapitres existants ne sont pas touchés : '
+    +   'si un titre correspond déjà, il est laissé tel quel.</p></div>'
+    + '<div id="pgOut"></div>'
+    + "</div></div>"
+    + '<div class="modal-foot"><span class="note" id="pgEtat"></span><div style="flex:1"></div>'
+    + '<button class="btn" data-x>Annuler</button><button class="btn pri" id="pgGo">Structurer</button></div>', {wide:true, sticky:true});
+
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+  $("#pgTxt").focus();
+
+  $("#pgGo").onclick = async ()=>{
+    const txt = $("#pgTxt").value.trim(), mid2 = $("#pgM").value;
+    if(!txt){ toast("Colle d'abord le programme"); return; }
+    if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
+    const btn = $("#pgGo"); btn.disabled = true;
+    $("#pgEtat").innerHTML = '<span class="thinking"><i></i>Lecture du programme…</span>';
+    try{
+      const m = matById(mid2);
+      const res = await iaJson({
+        system: NIVEAU,
+        messages: [{ role:"user", content:
+          "Voici le programme d'un semestre en « " + (m?m.nom:"?") + " », tel que le professeur l'a communiqué.\n\n"
+          + txt.slice(0,20000) + "\n\n"
+          + "Transforme-le en une liste ordonnée de chapitres. Règles :\n"
+          + "- un chapitre par unité d'enseignement identifiable (séance, thème, partie) ;\n"
+          + "- \"titre\" reprend les mots du programme, sans les reformuler ni les enjoliver ;\n"
+          + "- \"objectifs\" : 1 à 3 compétences visées, formulées à l'infinitif, uniquement si le programme les indique ou les implique clairement ;\n"
+          + "- \"notions\" : les termes techniques cités dans le programme pour ce chapitre ;\n"
+          + "- \"periode\" : la date ou la semaine si le programme en donne une, sinon une chaîne vide.\n"
+          + "N'invente aucun chapitre absent du programme." }],
+        schema: SCHEMA_PROGRAMME, effort: "medium", maxTokens: 8000
+      });
+      const chaps = (res && res.chapitres) || [];
+      if(!chaps.length){ $("#pgEtat").textContent = "Aucun chapitre identifié."; btn.disabled = false; return; }
+      $("#pgEtat").textContent = chaps.length + " chapitre(s) identifié(s)";
+      apercuProgramme(chaps, mid2);
+    }catch(e){
+      $("#pgEtat").textContent = msgErreur(e);
+      btn.disabled = false;
+    }
+  };
+}
+
+function apercuProgramme(chaps, mid){
+  const existants = chapsOf(mid);
+  const host = $("#pgOut");
+  host.innerHTML = '<h3 style="font-size:15px;margin:14px 0 10px">Vérifie avant de créer</h3>'
+    + chaps.map((c,i)=>{
+        const doublon = existants.find(x=>x.titre.toLowerCase().trim() === String(c.titre||"").toLowerCase().trim());
+        return '<div class="result" data-pg="'+i+'">'
+          + '<div class="result-head">'
+          +   '<input value="'+esc(c.titre||"")+'" data-f="titre" aria-label="Titre du chapitre">'
+          +   '<input class="field" style="width:64px;padding:5px 8px" type="number" value="'+esc(c.numero||i+1)+'" data-f="numero" aria-label="Numéro">'
+          + "</div>"
+          + '<div class="result-body">'
+          +   (doublon ? '<p class="note" style="color:var(--attention);margin-bottom:8px">Ce chapitre existe déjà — il sera ignoré.</p>' : "")
+          +   (c.periode ? '<p class="note" style="margin-bottom:6px">'+esc(c.periode)+"</p>" : "")
+          +   (c.notions && c.notions.length ? '<div class="chap-meta" style="margin-bottom:8px">'
+                + c.notions.slice(0,8).map(n=>'<span class="pill type">'+esc(n)+"</span>").join("") + "</div>" : "")
+          +   (c.objectifs && c.objectifs.length ? '<ul style="margin:0;padding-left:18px;font-size:13.5px;color:var(--texte-2)">'
+                + c.objectifs.map(o=>"<li>"+esc(o)+"</li>").join("") + "</ul>" : "")
+          +   '<div class="doc-actions"><button class="btn sm fantome danger" data-drop="'+i+'">Écarter</button></div>'
+          + "</div></div>";
+      }).join("")
+    + '<button class="btn pri large" id="pgSave" style="margin-top:6px">Créer ces chapitres</button>';
+
+  host.querySelectorAll("[data-drop]").forEach(b=>b.onclick=()=>b.closest(".result").remove());
+
+  $("#pgSave").onclick = async ()=>{
+    const cartes = Array.from(host.querySelectorAll(".result"));
+    let n = 0;
+    for(const r of cartes){
+      const idx = Number(r.dataset.pg);
+      const src = chaps[idx] || {};
+      const titre = r.querySelector('[data-f="titre"]').value.trim();
+      if(!titre) continue;
+      if(chapsOf(mid).some(x=>x.titre.toLowerCase().trim() === titre.toLowerCase())) continue;
+      state.chapitres.push({
+        id: uid(), matiereId: mid, titre,
+        numero: Number(r.querySelector('[data-f="numero"]').value) || (n+1),
+        statut: "nouveau", note: src.periode || "",
+        origine: "programme",
+        objectifs: src.objectifs || [],
+        notions: src.notions || []
+      });
+      n++;
+    }
+    await saveStructure();
+    state.selMat = mid;
+    closeModal();
+    aller("matiere", { mat: mid });
+    toast(n ? n + " chapitre(s) créé(s)" : "Aucun nouveau chapitre");
+  };
+}
+
+/* Aperçu d'un chapitre à venir : ancré dans des sources vérifiables. */
+async function preparerChapitre(cid){
+  const c = chapById(cid); if(!c) return;
+  if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
+  const m = matById(c.matiereId);
+  const ancre = IA.mode === "api" && IA.fournisseur === "gemini";
+
+  showPanel(); state.tab = "analyse";
+  $("#panelBody").innerHTML = '<div class="card"><span class="thinking"><i></i>'
+    + (ancre ? "Recherche et rédaction de l'aperçu…" : "Rédaction de l'aperçu…")
+    + '</span><div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
+
+  const sources = [];
+  try{
+    const texte = await iaTexte({
+      system: NIVEAU + "\n\nTu prépares un étudiant à un chapitre qu'il n'a pas encore suivi. "
+        + "Tu n'inventes pas le cours du professeur : tu donnes le contenu standard du sujet, "
+        + "en signalant ce qui peut varier d'un enseignement à l'autre.",
+      messages: [{ role:"user", content:
+        "Matière : " + (m?m.nom:"?") + "\nChapitre : " + c.titre
+        + (c.notions && c.notions.length ? "\nNotions annoncées par le programme : " + c.notions.join(", ") : "")
+        + (c.objectifs && c.objectifs.length ? "\nObjectifs annoncés : " + c.objectifs.join(" ; ") : "")
+        + "\n\nRédige un aperçu en markdown, structuré ainsi :\n"
+        + "## Ce que ce chapitre établit — 3 à 5 phrases sur le raisonnement d'ensemble.\n"
+        + "## Notions à maîtriser — chaque terme suivi d'une définition d'une ligne, au niveau 1re année.\n"
+        + "## Prérequis — ce qu'il faut déjà savoir pour suivre.\n"
+        + "## Méthodes et formules — s'il y en a, énoncées précisément.\n"
+        + "## Exercices types — 3 énoncés représentatifs, avec la démarche de résolution, sans le calcul complet.\n"
+        + "## Pièges classiques — les erreurs fréquentes sur ce chapitre.\n\n"
+        + (ancre ? "Appuie-toi sur des sources en ligne fiables (universités, manuels de référence, cours publics) et cite-les.\n" : "")
+        + "Sois rigoureux : ce document sert à un étudiant d'école de commerce, pas à un lycéen. "
+        + "Si une notion admet plusieurs conventions, dis-le explicitement." }],
+      effort: "high", maxTokens: 12000, recherche: ancre, sources,
+      onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
+    });
+
+    let contenu = texte;
+    if(sources.length){
+      contenu += "\n\n## Sources\n" + sources.slice(0,10)
+        .map(s=>"- ["+String(s.titre).replace(/[\[\]]/g,"")+"]("+s.url+")").join("\n");
+    }
+
+    const it = { id:uid(), matiereId:c.matiereId, chapitreId:cid, type:"apercu",
+      titre:"Aperçu — "+c.titre, contenu, source:"ia", ancre: sources.length>0,
+      date:new Date().toISOString() };
+    state.items.push(it); await saveItem(it);
+    state.openDocs.add(it.id);
+    aller("chapitre", { chap:cid, mat:c.matiereId });
+    toast(sources.length ? "Aperçu créé — " + sources.length + " source(s)" : "Aperçu créé");
+  }catch(e){ iaError(e); renderPanel(); }
+}
+
 /* ---------- réglages ---------- */
 function openSettings(){
   const nb = state.items.length, poids = Math.round(JSON.stringify(state.items).length/1024);
@@ -1985,6 +2189,7 @@ function openCreation(){
     + '<div class="modal-body"><div class="creation-liste">'
     + ligne("photo","▣","Importer des photos","Tes notes sont lues, triées et rangées")
     + ligne("texte","✎","Écrire un cours","Saisir ou coller, avec mise au propre")
+    + ligne("programme","☰","Coller le programme", m ? "Le semestre de « "+m.nom+" » en chapitres" : "Le semestre en chapitres")
     + ligne("chapitre","§","Nouveau chapitre", m ? "Dans « "+m.nom+" »" : "Dans une matière")
     + ligne("matiere","◍","Nouvelle matière","Ajouter ou renommer tes matières")
     + "</div></div>");
@@ -1993,10 +2198,11 @@ function openCreation(){
   document.querySelectorAll("[data-faire]").forEach(b=>b.onclick=()=>{
     const quoi = b.dataset.faire;
     closeModal();
-    if(quoi === "photo")    return openImport();
-    if(quoi === "texte")    return openEditor(state.vue === "chapitre" && state.selChap ? { chapitreId: state.selChap } : {});
-    if(quoi === "chapitre") return openChapModal(null);
-    if(quoi === "matiere")  return openMatieresModal();
+    if(quoi === "photo")     return openImport();
+    if(quoi === "texte")     return openEditor(state.vue === "chapitre" && state.selChap ? { chapitreId: state.selChap } : {});
+    if(quoi === "programme") return openProgramme(state.selMat);
+    if(quoi === "chapitre")  return openChapModal(null);
+    if(quoi === "matiere")   return openMatieresModal();
   });
 }
 
@@ -2157,6 +2363,7 @@ function vueMatiere(){
     + '<div class="doc-actions" style="margin:6px 0 4px">'
     +   '<button class="btn pri sm" data-import="1">＋ Importer</button>'
     +   '<button class="btn sm" data-ecrire="1">✎ Écrire</button>'
+    +   '<button class="btn sm" data-programme="1">☰ Programme</button>'
     +   '<button class="btn sm" data-newchap="1">Chapitre</button>'
     +   '<button class="btn sm fantome" data-editmat="1">Modifier</button>'
     + "</div>"
@@ -2201,11 +2408,21 @@ function vueChapitre(){
     +   '<h1 style="font-family:var(--lecture);font-size:27px;line-height:1.2">'+esc(c.titre)+"</h1>"
     +   (c.note ? '<p class="note" style="margin-top:8px">'+esc(c.note)+"</p>" : "")
     + "</div>"
+    + (c.origine === "programme" && ((c.objectifs&&c.objectifs.length) || (c.notions&&c.notions.length))
+        ? '<div class="card"><h4>Annoncé au programme</h4>'
+          + (c.objectifs && c.objectifs.length
+              ? '<ul style="margin:0 0 8px;padding-left:18px;font-size:14px">'+c.objectifs.map(o=>"<li>"+esc(o)+"</li>").join("")+"</ul>" : "")
+          + (c.notions && c.notions.length
+              ? '<div class="chap-meta">'+c.notions.map(n=>'<span class="pill type">'+esc(n)+"</span>").join("")+"</div>" : "")
+          + "</div>"
+        : "")
     + '<div class="seg" style="margin-bottom:12px">'
     +   Object.keys(STATUTS).map(k=>'<button data-statut="'+k+'" aria-pressed="'+((c.statut||"nouveau")===k)+'">'+STATUTS[k]+"</button>").join("")
     + "</div>"
     + '<div class="doc-actions" style="margin-bottom:6px">'
-    +   '<button class="btn pri sm" data-analyse="'+c.id+'">'+(a?"Relancer l'analyse":"Analyser ce chapitre")+"</button>"
+    +   (its.length
+        ? '<button class="btn pri sm" data-analyse="'+c.id+'">'+(a?"Relancer l'analyse":"Analyser ce chapitre")+"</button>"
+        : '<button class="btn pri sm" data-preparer="'+c.id+'">Préparer ce chapitre</button>')
     +   '<button class="btn sm" data-question="'+c.id+'">Poser une question</button>'
     +   '<button class="btn sm" data-import="1">＋ Importer</button>'
     +   '<button class="btn sm" data-ecrire="'+c.id+'">✎ Écrire</button>'
@@ -2231,7 +2448,13 @@ function vueChapitre(){
               + '<span class="doc-date">'+(d&&!isNaN(d)?d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"}):"")+"</span>"
               + "<span class='chevron' style='transform:rotate("+(ouvert?90:0)+"deg)'>›</span></button>"
               + (ouvert
-                  ? '<div class="doc-corps"><div class="prose">'+md(i.contenu)+"</div>"
+                  ? '<div class="doc-corps">'
+                    + (i.type === "apercu"
+                        ? '<div class="avertit">Aperçu généré à partir du programme — '
+                          + (i.ancre ? "appuyé sur des sources listées en fin de document." : "sans sources vérifiables.")
+                          + " Ce n'est pas le cours de ton professeur : confronte-le à ce qui sera dit en amphi.</div>"
+                        : "")
+                    + '<div class="prose">'+md(i.contenu)+"</div>"
                     + '<div class="doc-actions">'
                     +   '<button class="btn sm" data-edit="'+i.id+'">Modifier</button>'
                     +   '<button class="btn sm" data-expliquer="'+i.id+'">Expliquer</button>'
@@ -2443,6 +2666,8 @@ function câbler(scene){
   q("[data-import]").forEach(b=>b.onclick=()=>openImport());
   q("[data-ecrire]").forEach(b=>b.onclick=()=>openEditor(b.dataset.ecrire ? {chapitreId:b.dataset.ecrire} : {}));
   q("[data-newchap]").forEach(b=>b.onclick=()=>openChapModal(null));
+  q("[data-programme]").forEach(b=>b.onclick=()=>openProgramme(state.selMat));
+  q("[data-preparer]").forEach(b=>b.onclick=()=>preparerChapitre(b.dataset.preparer));
   q("[data-editmat]").forEach(b=>b.onclick=openMatieresModal);
   q("[data-editchap]").forEach(b=>b.onclick=()=>openChapModal(b.dataset.editchap));
   q("[data-delchap]").forEach(b=>b.onclick=()=>delChapitre(b.dataset.delchap));
