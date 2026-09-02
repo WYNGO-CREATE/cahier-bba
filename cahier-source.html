@@ -978,6 +978,12 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
     // « only supports Interactions API », « not supported for generateContent » :
     // le catalogue annonce le modèle, mais il refuse cette API. C'est un problème
     // de modèle, pas de clé — on l'écarte et on prend le suivant.
+    // Refus portant sur l'outil de recherche, pas sur le modèle : on le
+    // distingue pour pouvoir réessayer sans ancrage au lieu d'abandonner.
+    if(recherche && /tool|google_?search|grounding|function/i.test(msg)){
+      const e2 = new Error(msg || ("HTTP "+res.status));
+      e2.code = "recherche_refusee"; throw e2;
+    }
     const modeleRefuse = /only supports|not supported for|is not supported|does not support/i.test(msg);
     err.code = res.status === 404 || modeleRefuse ? "modele_inconnu"
              : res.status === 400 && /API key/i.test(msg) ? "cle_invalide"
@@ -1337,7 +1343,12 @@ function msgErreur(e){
   if(c==="images_unavailable") return "Cette vue ne peut pas envoyer d'images. Ouvre le classeur depuis l'application Claude, ou colle le texte dans « Écrire un cours ».";
   if(c==="session_expired") return "Session expirée — reconnecte-toi puis réessaie.";
   if(c==="cancelled") return "Interrompu.";
-  return "L'assistant n'a pas pu répondre. Réessaie.";
+  if(c==="upstream_error") return "Le service a échoué en cours de réponse"
+    + (e.message ? " : « "+e.message+" »" : ". Réessaie dans un instant.");
+  // Jamais de message muet : si le fournisseur a dit quelque chose, on le montre.
+  return "L'assistant n'a pas pu répondre"
+    + (e && e.message ? " — réponse du fournisseur : « " + e.message + " »" : ". Réessaie.")
+    + (c ? " (code : " + c + ")" : "");
 }
 function iaError(e){ toast(msgErreur(e), 4200); }
 let modalSticky = false;
@@ -1912,8 +1923,9 @@ async function preparerChapitre(cid){
     + '</span><div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
 
   const sources = [];
-  try{
-    const texte = await iaTexte({
+  let avecAncrage = ancre;
+
+  const demander = (rech) => iaTexte({
       system: NIVEAU + "\n\nTu prépares un étudiant à un chapitre qu'il n'a pas encore suivi. "
         + "Tu n'inventes pas le cours du professeur : tu donnes le contenu standard du sujet, "
         + "en signalant ce qui peut varier d'un enseignement à l'autre.",
@@ -1928,12 +1940,29 @@ async function preparerChapitre(cid){
         + "## Méthodes et formules — s'il y en a, énoncées précisément.\n"
         + "## Exercices types — 3 énoncés représentatifs, avec la démarche de résolution, sans le calcul complet.\n"
         + "## Pièges classiques — les erreurs fréquentes sur ce chapitre.\n\n"
-        + (ancre ? "Appuie-toi sur des sources en ligne fiables (universités, manuels de référence, cours publics) et cite-les.\n" : "")
+        + (rech ? "Appuie-toi sur des sources en ligne fiables (universités, manuels de référence, cours publics) et cite-les.\n" : "")
         + "Sois rigoureux : ce document sert à un étudiant d'école de commerce, pas à un lycéen. "
         + "Si une notion admet plusieurs conventions, dis-le explicitement." }],
-      effort: "high", maxTokens: 12000, recherche: ancre, sources,
+      effort: "high", maxTokens: 12000, recherche: rech, sources,
       onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
     });
+
+  try{
+    let texte;
+    try{
+      texte = await demander(ancre);
+    }catch(e){
+      // La recherche web n'est pas disponible pour ce modèle : on produit
+      // quand même l'aperçu, sans ancrage, et on le signalera.
+      if(ancre && e && (e.code === "recherche_refusee" || e.code === "invalid_request")){
+        avecAncrage = false;
+        sources.length = 0;
+        const el = $("#liveOut"); if(el) el.textContent = "";
+        $("#panelBody").querySelector(".thinking").innerHTML =
+          "<i></i>Recherche web indisponible — rédaction sans sources…";
+        texte = await demander(false);
+      }else throw e;
+    }
 
     let contenu = texte;
     if(sources.length){
@@ -1947,7 +1976,9 @@ async function preparerChapitre(cid){
     state.items.push(it); await saveItem(it);
     state.openDocs.add(it.id);
     aller("chapitre", { chap:cid, mat:c.matiereId });
-    toast(sources.length ? "Aperçu créé — " + sources.length + " source(s)" : "Aperçu créé");
+    toast(sources.length ? "Aperçu créé — " + sources.length + " source(s)"
+        : (ancre && !avecAncrage) ? "Aperçu créé, sans sources : recherche web indisponible"
+        : "Aperçu créé");
   }catch(e){ iaError(e); renderPanel(); }
 }
 
