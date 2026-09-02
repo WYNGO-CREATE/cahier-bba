@@ -926,10 +926,23 @@ function reintegrerModele(n){
    ceux qui se sont déjà montrés inutilisables. Renvoie la liste ordonnée. */
 function classerModeles(noms){
   const exclus = lireExclus();
-  const utiles = (noms||[]).filter(n=>!/embed|aqa|imagen|veo|tts|audio|live|-image|gemma/i.test(n) && !exclus.has(n));
+  // « deep-research » et consorts sont des modèles à API dédiée : ils figurent au
+  // catalogue mais refusent l'appel standard. Écartés d'emblée.
+  const horsSujet = /embed|aqa|imagen|veo|tts|audio|live|-image|gemma|deep-research|robotics|computer-use|guard/i;
+  const utiles = (noms||[]).filter(n=>!horsSujet.test(n) && !exclus.has(n));
   if(!utiles.length) return [];
   // « gemini-3-flash » → 3 ; « gemini-2.5-flash » → 2.5 ; « claude-opus-4-8 » → 4.8
-  const version = n=>{ const m = n.match(/(\d+)(?:[.\-](\d+))?/); return m ? parseFloat(m[1] + "." + (m[2]||"0")) : 0; };
+  // Les suffixes de date (« -12-2025 ») sont retirés avant lecture : sans ça un
+  // modèle daté passait pour une version 12 et raflait la première place.
+  const version = n=>{
+    const sansDate = n.replace(/[-_](?:0?[1-9]|1[0-2])[-_]20\d\d\b/g, "").replace(/[-_]20\d{2,6}\b/g, "");
+    const m = sansDate.match(/(\d+)(?:[.\-](\d+))?/);
+    if(!m) return 0;
+    const maj = parseInt(m[1], 10);
+    if(maj > 30) return 0;                                  // encore une date déguisée
+    const min = (m[2] && m[2].length <= 2) ? m[2] : "0";
+    return parseFloat(maj + "." + min);
+  };
   const score = n=>{
     let s = version(n) * 10;
     if(/flash/i.test(n)) s += 30;          // rapide et économique : idéal pour l'OCR au quotidien
@@ -989,7 +1002,9 @@ async function diagnostic(progres){
     const avant = IA.modele;
     IA.modele = n;
     try{
-      await appelAPI({ messages:[{ role:"user", content:"Réponds exactement : OK" }], maxTokens:32, effort:"low" }, true);
+      // Budget large : les modèles qui réfléchissent avant d'écrire épuisent un
+      // petit quota en réflexion et rendraient une réponse vide à tort.
+      await appelAPI({ messages:[{ role:"user", content:"Réponds exactement : OK" }], maxTokens:1024, effort:"low" }, true);
       dire("  [OK] " + n + " — répond");
       if(!bon) bon = n;
     }catch(e){
@@ -1035,10 +1050,14 @@ async function validerModele(nom){
   const avant = IA.modele;
   IA.modele = nom;
   try{
-    await appelAPI({ messages:[{ role:"user", content:"Réponds exactement : OK" }], maxTokens: 32, effort:"low" }, true);
+    await appelAPI({ messages:[{ role:"user", content:"Réponds exactement : OK" }], maxTokens: 1024, effort:"low" }, true);
     return true;
   }catch(e){
+    // Refus franc de l'API : le modèle est inutilisable, on le retient.
     if(e && (e.code === "modele_inconnu" || e.code === "invalid_request")){ exclureModele(nom); return false; }
+    // Réponse vide : signal trop faible pour condamner un modèle définitivement —
+    // on passe au suivant sans l'écarter pour toujours.
+    if(e && e.code === "empty_completion"){ IA.modele = avant; return false; }
     IA.modele = avant; throw e;   // clé invalide, quota… : ce n'est pas le modèle
   }
 }
