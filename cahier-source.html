@@ -121,8 +121,13 @@
   .rangee-int{display:flex;gap:14px;padding:0 16px;margin:0 auto;min-width:min-content}
   .pastille{display:flex;flex-direction:column;align-items:center;gap:6px;width:68px;flex:none}
   .anneau{
-    width:60px;height:60px;border-radius:50%;padding:2.5px;display:grid;place-items:center;
+    position:relative;width:60px;height:60px;border-radius:50%;padding:2.5px;display:grid;place-items:center;
     transition:transform .14s
+  }
+  .anneau .badge{
+    position:absolute;top:-2px;right:-2px;min-width:19px;height:19px;padding:0 5px;border-radius:99px;
+    background:var(--alerte);color:#fff;font-size:11px;font-weight:700;font-style:normal;
+    display:grid;place-items:center;box-shadow:0 0 0 2.5px var(--fond);font-variant-numeric:tabular-nums
   }
   .pastille:active .anneau{transform:scale(.94)}
   .anneau i{
@@ -291,6 +296,18 @@
   .card h4{font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--texte-3);
     font-weight:650;margin-bottom:9px}
   .note{font-size:13px;color:var(--texte-2);line-height:1.5}
+
+  /* menu de création */
+  .creation-liste{display:flex;flex-direction:column;gap:8px}
+  .creation{display:flex;align-items:center;gap:14px;width:100%;text-align:left;
+    padding:14px;border-radius:var(--r);border:1px solid var(--trait);background:var(--surface-2)}
+  .creation:hover{border-color:var(--accent);background:var(--surface-3)}
+  .creation:active{transform:scale(.99)}
+  .creation-ic{width:44px;height:44px;flex:none;border-radius:13px;background:var(--accent-doux);
+    color:var(--accent);display:grid;place-items:center;font-size:20px}
+  .creation span:nth-child(2){flex:1;min-width:0}
+  .creation b{display:block;font-size:15.5px;font-weight:650}
+  .creation em{display:block;font-style:normal;font-size:13px;color:var(--texte-2);margin-top:2px}
 
   .drop{border:1.5px dashed var(--trait-fort);border-radius:16px;padding:30px 20px;text-align:center;
     background:var(--surface-2);transition:border-color .15s,background .15s}
@@ -1942,10 +1959,37 @@ function renderOnglets(){
     + item("reglages","Réglages",ICONES.reglages);
 
   $("#onglets").querySelectorAll("[data-vue]").forEach(b=>b.onclick=()=>aller(b.dataset.vue));
-  $("#onglets").querySelector("[data-creer]").onclick = ()=>{
-    if(!state.matieres.length){ openMatieresModal(); return; }
-    openImport();
-  };
+  $("#onglets").querySelector("[data-creer]").onclick = openCreation;
+}
+
+/* Le « + » ouvre un menu : toutes les façons de nourrir le cahier sont
+   à un geste, depuis n'importe quelle vue. */
+function openCreation(){
+  if(!state.matieres.length){ openMatieresModal(); return; }
+  const m = matById(state.selMat);
+  const ligne = (cle, ic, titre, sous) =>
+    '<button class="creation" data-faire="'+cle+'">'
+    + '<span class="creation-ic">'+ic+"</span>"
+    + "<span><b>"+titre+"</b><em>"+esc(sous)+"</em></span>"
+    + "<span class='chevron'>›</span></button>";
+
+  modal('<div class="modal-head"><h2>Ajouter au cahier</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><div class="creation-liste">'
+    + ligne("photo","▣","Importer des photos","Tes notes sont lues, triées et rangées")
+    + ligne("texte","✎","Écrire un cours","Saisir ou coller, avec mise au propre")
+    + ligne("chapitre","§","Nouveau chapitre", m ? "Dans « "+m.nom+" »" : "Dans une matière")
+    + ligne("matiere","◍","Nouvelle matière","Ajouter ou renommer tes matières")
+    + "</div></div>");
+
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+  document.querySelectorAll("[data-faire]").forEach(b=>b.onclick=()=>{
+    const quoi = b.dataset.faire;
+    closeModal();
+    if(quoi === "photo")    return openImport();
+    if(quoi === "texte")    return openEditor(state.vue === "chapitre" && state.selChap ? { chapitreId: state.selChap } : {});
+    if(quoi === "chapitre") return openChapModal(null);
+    if(quoi === "matiere")  return openMatieresModal();
+  });
 }
 
 /* ---------- éléments réutilisés ---------- */
@@ -1957,13 +2001,17 @@ function avancement(mid){
   return Math.round(cs.filter(c=>c.statut==="maitrise").length / cs.length * 100);
 }
 
+const lacunesDe = mid => chapsOf(mid).reduce((n,c)=>n + ((c.analyse && c.analyse.lacunes) ? c.analyse.lacunes.length : 0), 0);
+
 function anneau(m, actif){
   const pct = avancement(m.id);
   const c = m.couleur || "#4DD6A8";
   const fond = pct > 0
     ? "conic-gradient("+c+" 0 "+pct+"%, var(--trait) "+pct+"% 100%)"
     : (actif ? c : "var(--trait)");
-  return '<span class="anneau" style="background:'+fond+'"><i>'+esc(initiales(m.nom))+"</i></span>";
+  const lac = lacunesDe(m.id);
+  return '<span class="anneau" style="background:'+fond+'"><i>'+esc(initiales(m.nom))+"</i>"
+    + (lac ? '<b class="badge">'+(lac>9?"9+":lac)+"</b>" : "") + "</span>";
 }
 
 function rangeeMatieres(){
@@ -2026,7 +2074,7 @@ function vueCahier(){
     .sort((a,b)=>String(b.date||"").localeCompare(String(a.date||"")))
     .slice(0,12);
 
-  scene.innerHTML = entete("Cahier")
+  scene.innerHTML = entete("Cahier", false, ACTION_CHERCHER + ACTION_AJOUT)
     + rangeeMatieres()
     + '<div class="colonne">'
     + (aReprendre.length
@@ -2053,12 +2101,18 @@ function vueCahier(){
   câbler(scene);
 }
 
-function entete(titre, avecRetour){
+function entete(titre, avecRetour, actions){
   return '<header class="entete"><div class="entete-ligne">'
     + (avecRetour ? '<button class="retour" data-retour="1">‹ <span>Retour</span></button>' : '<span class="marque">'+esc(titre)+"</span>")
-    + (avecRetour ? '<span class="titre-vue">'+esc(titre)+"</span><span style='width:64px'></span>" : "")
+    + (avecRetour ? '<span class="titre-vue">'+esc(titre)+"</span>" : "")
+    + (actions || (avecRetour ? "<span style='width:64px'></span>" : ""))
     + "</div></header>";
 }
+
+const ACTION_CHERCHER = '<button class="icone-btn" data-vue-aller="recherche" aria-label="Chercher">'
+  + '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">'
+  + '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg></button>';
+const ACTION_AJOUT = '<button class="icone-btn" data-creation="1" aria-label="Ajouter">＋</button>';
 
 /* =========================================================
    VUE — MATIÈRE
@@ -2068,8 +2122,10 @@ function vueMatiere(){
   if(!m) return aller("cahier");
   const scene = $("#scene"), cs = chapsOf(m.id), its = itemsOfMat(m.id);
   const pct = avancement(m.id);
+  const enCours = cs.find(c=>c.statut === "encours");
+  const lac = lacunesDe(m.id);
 
-  scene.innerHTML = entete(m.nom, true)
+  scene.innerHTML = entete(m.nom, true, ACTION_AJOUT)
     + '<div class="colonne">'
     + '<div style="display:flex;align-items:center;gap:14px;padding:18px 0 10px">'
     +   anneau(m, true)
@@ -2082,6 +2138,14 @@ function vueMatiere(){
     +     '<div class="jauge"><i style="width:'+pct+'%;background:'+esc(m.couleur)+'"></i></div>'
     +   "</div>"
     + "</div>"
+    + ((enCours || lac || m.code || m.prof)
+        ? '<div class="chap-meta" style="margin-bottom:12px">'
+          + (m.code ? '<span class="etiq type">'+esc(m.code)+"</span>" : "")
+          + (m.prof ? '<span class="etiq type">'+esc(m.prof)+"</span>" : "")
+          + (enCours ? '<button class="etiq encours" data-chap="'+enCours.id+'">En cours · Ch. '+esc(enCours.numero||"?")+" "+esc(enCours.titre)+"</button>" : "")
+          + (lac ? '<span class="etiq manque">'+lac+" à compléter</span>" : "")
+          + "</div>"
+        : "")
     + '<div class="doc-actions" style="margin:6px 0 4px">'
     +   '<button class="btn pri sm" data-import="1">＋ Importer</button>'
     +   '<button class="btn sm" data-ecrire="1">✎ Écrire</button>'
@@ -2118,7 +2182,7 @@ function vueChapitre(){
   const m = matById(c.matiereId), its = itemsOf(c.id), scene = $("#scene");
   const a = c.analyse;
 
-  scene.innerHTML = entete("Ch. " + (c.numero||"?"), true)
+  scene.innerHTML = entete("Ch. " + (c.numero||"?"), true, ACTION_AJOUT)
     + '<div class="colonne">'
     + '<div style="padding:16px 0 10px">'
     +   '<div class="chap-meta" style="margin-bottom:8px">'
@@ -2350,6 +2414,8 @@ function importerJSON(){
 function câbler(scene){
   const q = s => scene.querySelectorAll(s);
   q("[data-retour]").forEach(b=>b.onclick=retour);
+  q("[data-vue-aller]").forEach(b=>b.onclick=()=>aller(b.dataset.vueAller));
+  q("[data-creation]").forEach(b=>b.onclick=openCreation);
   q("[data-mat]").forEach(b=>b.onclick=()=>aller("matiere",{mat:b.dataset.mat}));
   q("[data-ajout]").forEach(b=>b.onclick=openMatieresModal);
   q("[data-chap]").forEach(b=>b.onclick=()=>{
