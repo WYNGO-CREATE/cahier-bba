@@ -923,7 +923,8 @@ async function appelGemini(o, essais){
   essais = essais || 0;
   try{
     return await appelGeminiBrut(o);
-  }catch(e){
+  }catch(brut){
+    const e = normErreur(brut);
     if(e && e.code === "modele_inconnu" && essais < 4 && await reparerModele()){
       return appelGemini(o, essais + 1);
     }
@@ -1039,7 +1040,8 @@ async function appelAPI(o, sansReparation){
   if(o && o.recherche) o = { ...o, recherche:false };
   try{
     return await appelAnthropic(o);
-  }catch(e){
+  }catch(brut){
+    const e = normErreur(brut);
     if(e && e.code === "modele_inconnu" && !sansReparation && await reparerModele()){
       return appelAPI(o, true);
     }
@@ -1123,6 +1125,38 @@ async function appelAnthropic({ system, messages, images, effort, maxTokens, sch
   return texte;
 }
 
+/* ---------- travail long : délai, annulation, compteur ----------
+   Sans délai maximum, une connexion qui reste ouverte sans rien renvoyer
+   fige l'écran indéfiniment. On borne, on montre le temps écoulé, et on
+   laisse toujours une porte de sortie. */
+function chantier(cible, libelle, opts){
+  opts = opts || {};
+  const ctl = new AbortController(), t0 = Date.now();
+  const peindre = ()=>{
+    if(!cible || !cible.isConnected) return;
+    const s = Math.round((Date.now() - t0) / 1000);
+    cible.innerHTML = '<span class="thinking"><i></i>' + esc(libelle) + " — " + s + " s</span> "
+      + '<button class="btn sm fantome" data-stop="1">Annuler</button>';
+    const b = cible.querySelector("[data-stop]");
+    if(b) b.onclick = ()=>ctl.abort();
+  };
+  peindre();
+  const battement = setInterval(peindre, 1000);
+  const limite = setTimeout(()=>ctl.abort(), opts.delai || 120000);
+  return { signal: ctl.signal, fini(){ clearInterval(battement); clearTimeout(limite); } };
+}
+
+/* Une interruption ou une coupure réseau doivent se lire comme telles. */
+function normErreur(e){
+  if(e && (e.name === "AbortError" || e.code === 20)){
+    const x = new Error("interrompu ou temps d'attente dépassé"); x.code = "delai_depasse"; return x;
+  }
+  if(e instanceof TypeError && /fetch|network|load failed|réseau/i.test(e.message || "")){
+    const x = new Error("connexion au fournisseur impossible"); x.code = "reseau"; return x;
+  }
+  return e;
+}
+
 /* ---------- reprises sur incident passager ----------
    Une saturation du fournisseur est temporaire : on réessaie tout seul,
    en espaçant, puis on bascule sur le modèle suivant du classement.
@@ -1139,9 +1173,10 @@ async function avecReprises(faire){
       await dodo(attentes[i]);
     }
     try{ return await faire(); }
-    catch(e){
+    catch(brut){
+      const e = normErreur(brut);
       derniere = e;
-      if(!estPassager(e && e.code)) throw e;
+      if(!estPassager(e && e.code)) throw e;   // une annulation ne se réessaie jamais
     }
   }
   // Toujours saturé : un autre modèle est peut-être disponible.
@@ -1167,12 +1202,12 @@ function normaliser(messages){
 }
 
 async function iaTexte(opts){
-  const { system, images, effort, maxTokens, onText, recherche, sources } = opts;
+  const { system, images, effort, maxTokens, onText, recherche, sources, signal } = opts;
   const messages = normaliser(opts.messages);
   if(IA.mode === "api"){
     const imgs = [];
     for(const f of (images||[])) imgs.push(await imageEnBase64(f));
-    return avecReprises(()=>appelAPI({ system, messages, images:imgs, effort, maxTokens, onText, recherche, sources }));
+    return avecReprises(()=>appelAPI({ system, messages, images:imgs, effort, maxTokens, onText, recherche, sources, signal }));
   }
   if(IA.mode === "artifact"){
     const turns = system ? [{ role:"user", content:system }].concat(messages) : messages.slice();
@@ -1253,8 +1288,9 @@ async function analyseChapitre(cid){
   if(!itemsOf(cid).length){ toast("Ce chapitre est vide — ajoute d'abord un document."); return; }
 
   state.selChap = cid; state.tab = "analyse"; showPanel();
-  $("#panelBody").innerHTML = '<div class="card"><span class="thinking"><i></i>Lecture du chapitre…</span>'
-    + '<p class="note" style="margin-top:10px">L\'agent relit tous tes documents. Compte 20 à 60 secondes.</p></div>';
+  $("#panelBody").innerHTML = '<div class="card"><div id="anEtat"></div>'
+    + '<p class="note" style="margin-top:10px">L\'agent relit tous tes documents.</p></div>';
+  const ch = chantier($("#anEtat"), "Lecture du chapitre", { delai: 150000 });
 
   const prompt = "Voici TOUS les documents dont l'étudiant dispose pour ce chapitre (cours tapés, retranscriptions de photos, exercices).\n\n"
     + ctxChapitre(c) + "\n\n"
@@ -1272,8 +1308,9 @@ async function analyseChapitre(cid){
     const a = await iaJson({
       system: NIVEAU,
       messages: [{ role:"user", content: prompt }],
-      schema: SCHEMA_ANALYSE, effort: "high", maxTokens: 16000
+      schema: SCHEMA_ANALYSE, effort: "high", maxTokens: 16000, signal: ch.signal
     });
+    ch.fini();
     c.analyse = {
       resume: a.resume||"", plan: a.plan||[], notions: a.notions||[],
       lacunes: a.lacunes||[], questions: a.questions||[],
@@ -1281,7 +1318,7 @@ async function analyseChapitre(cid){
     };
     await saveStructure(); render();
     toast(c.analyse.lacunes.length ? c.analyse.lacunes.length+" point(s) à compléter repéré(s)" : "Chapitre analysé — rien ne manque");
-  }catch(e){ iaError(e); renderPanel(); }
+  }catch(e){ ch.fini(); iaError(e); renderPanel(); }
 }
 
 async function ficheChapitre(cid){
@@ -1378,6 +1415,9 @@ function msgErreur(e){
   if(c==="images_unavailable") return "Cette vue ne peut pas envoyer d'images. Ouvre le classeur depuis l'application Claude, ou colle le texte dans « Écrire un cours ».";
   if(c==="session_expired") return "Session expirée — reconnecte-toi puis réessaie.";
   if(c==="cancelled") return "Interrompu.";
+  if(c==="delai_depasse") return "Interrompu — soit par toi, soit après deux minutes sans réponse. "
+    + "Si ça se reproduit, essaie avec un texte plus court, ou change de modèle dans les réglages.";
+  if(c==="reseau") return "Connexion impossible. Vérifie ta liaison internet, puis réessaie.";
   if(c==="upstream_error") return "Le service a échoué en cours de réponse"
     + (e.message ? " : « "+e.message+" »" : ". Réessaie dans un instant.");
   // Jamais de message muet : si le fournisseur a dit quelque chose, on le montre.
@@ -1865,10 +1905,11 @@ function openProgramme(mid){
     if(!txt){ toast("Colle d'abord le programme"); return; }
     if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
     const btn = $("#pgGo"); btn.disabled = true;
-    $("#pgEtat").innerHTML = '<span class="thinking"><i></i>Lecture du programme…</span>';
+    const ch = chantier($("#pgEtat"), "Lecture du programme", { delai: 120000 });
     try{
       const m = matById(mid2);
       const res = await iaJson({
+        signal: ch.signal,
         system: NIVEAU,
         messages: [{ role:"user", content:
           "Voici le programme d'un semestre en « " + (m?m.nom:"?") + " », tel que le professeur l'a communiqué.\n\n"
@@ -1880,13 +1921,17 @@ function openProgramme(mid){
           + "- \"notions\" : les termes techniques cités dans le programme pour ce chapitre ;\n"
           + "- \"periode\" : la date ou la semaine si le programme en donne une, sinon une chaîne vide.\n"
           + "N'invente aucun chapitre absent du programme." }],
-        schema: SCHEMA_PROGRAMME, effort: "medium", maxTokens: 8000
+        // Structurer un plan est une extraction, pas un raisonnement :
+        // l'effort minimal suffit et raccourcit nettement l'attente.
+        schema: SCHEMA_PROGRAMME, effort: "low", maxTokens: 8000
       });
+      ch.fini();
       const chaps = (res && res.chapitres) || [];
       if(!chaps.length){ $("#pgEtat").textContent = "Aucun chapitre identifié."; btn.disabled = false; return; }
       $("#pgEtat").textContent = chaps.length + " chapitre(s) identifié(s)";
       apercuProgramme(chaps, mid2);
     }catch(e){
+      ch.fini();
       $("#pgEtat").textContent = msgErreur(e);
       btn.disabled = false;
     }
@@ -1953,9 +1998,9 @@ async function preparerChapitre(cid){
   const ancre = IA.mode === "api" && IA.fournisseur === "gemini";
 
   showPanel(); state.tab = "analyse";
-  $("#panelBody").innerHTML = '<div class="card"><span class="thinking"><i></i>'
-    + (ancre ? "Recherche et rédaction de l'aperçu…" : "Rédaction de l'aperçu…")
-    + '</span><div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
+  $("#panelBody").innerHTML = '<div class="card"><div id="pcEtat"></div>'
+    + '<div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
+  const ch = chantier($("#pcEtat"), ancre ? "Recherche et rédaction" : "Rédaction de l'aperçu", { delai: 180000 });
 
   const sources = [];
   let avecAncrage = ancre;
@@ -1978,7 +2023,7 @@ async function preparerChapitre(cid){
         + (rech ? "Appuie-toi sur des sources en ligne fiables (universités, manuels de référence, cours publics) et cite-les.\n" : "")
         + "Sois rigoureux : ce document sert à un étudiant d'école de commerce, pas à un lycéen. "
         + "Si une notion admet plusieurs conventions, dis-le explicitement." }],
-      effort: "high", maxTokens: 12000, recherche: rech, sources,
+      effort: "high", maxTokens: 12000, recherche: rech, sources, signal: ch.signal,
       onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
     });
 
@@ -1993,8 +2038,7 @@ async function preparerChapitre(cid){
         avecAncrage = false;
         sources.length = 0;
         const el = $("#liveOut"); if(el) el.textContent = "";
-        $("#panelBody").querySelector(".thinking").innerHTML =
-          "<i></i>Recherche web indisponible — rédaction sans sources…";
+        toast("Recherche web indisponible — rédaction sans sources", 3000);
         texte = await demander(false);
       }else throw e;
     }
@@ -2008,13 +2052,14 @@ async function preparerChapitre(cid){
     const it = { id:uid(), matiereId:c.matiereId, chapitreId:cid, type:"apercu",
       titre:"Aperçu — "+c.titre, contenu, source:"ia", ancre: sources.length>0,
       date:new Date().toISOString() };
+    ch.fini();
     state.items.push(it); await saveItem(it);
     state.openDocs.add(it.id);
     aller("chapitre", { chap:cid, mat:c.matiereId });
     toast(sources.length ? "Aperçu créé — " + sources.length + " source(s)"
         : (ancre && !avecAncrage) ? "Aperçu créé, sans sources : recherche web indisponible"
         : "Aperçu créé");
-  }catch(e){ iaError(e); renderPanel(); }
+  }catch(e){ ch.fini(); iaError(e); renderPanel(); }
 }
 
 /* ---------- réglages ---------- */
