@@ -1123,6 +1123,41 @@ async function appelAnthropic({ system, messages, images, effort, maxTokens, sch
   return texte;
 }
 
+/* ---------- reprises sur incident passager ----------
+   Une saturation du fournisseur est temporaire : on réessaie tout seul,
+   en espaçant, puis on bascule sur le modèle suivant du classement.
+   Le modèle saturé n'est jamais mis à l'écart : il refonctionnera. */
+const dodo = ms => new Promise(r=>setTimeout(r, ms));
+const estPassager = c => c === "upstream_error" || c === "rate_limited";
+
+async function avecReprises(faire){
+  const attentes = [0, 2000, 5000];
+  let derniere;
+  for(let i = 0; i < attentes.length; i++){
+    if(attentes[i]){
+      toast("Service saturé — nouvelle tentative dans " + (attentes[i]/1000) + " s", attentes[i]);
+      await dodo(attentes[i]);
+    }
+    try{ return await faire(); }
+    catch(e){
+      derniere = e;
+      if(!estPassager(e && e.code)) throw e;
+    }
+  }
+  // Toujours saturé : un autre modèle est peut-être disponible.
+  try{
+    const suivant = classerModeles(await listerModeles()).find(n => n !== IA.modele);
+    if(suivant){
+      const avant = IA.modele;
+      toast("Bascule sur " + suivant, 3000);
+      enregistrerConfig({ modele: suivant });
+      try{ return await faire(); }
+      catch(e2){ enregistrerConfig({ modele: avant }); }
+    }
+  }catch(e3){ /* on retombe sur l'erreur d'origine, plus parlante */ }
+  throw derniere;
+}
+
 /* ---------- interface unique utilisée par tout le reste de l'app ---------- */
 /* Les deux moteurs exigent que l'échange commence par un tour "user". */
 function normaliser(messages){
@@ -1137,7 +1172,7 @@ async function iaTexte(opts){
   if(IA.mode === "api"){
     const imgs = [];
     for(const f of (images||[])) imgs.push(await imageEnBase64(f));
-    return appelAPI({ system, messages, images:imgs, effort, maxTokens, onText, recherche, sources });
+    return avecReprises(()=>appelAPI({ system, messages, images:imgs, effort, maxTokens, onText, recherche, sources }));
   }
   if(IA.mode === "artifact"){
     const turns = system ? [{ role:"user", content:system }].concat(messages) : messages.slice();
@@ -1156,7 +1191,7 @@ async function iaJson(opts){
   if(IA.mode === "api"){
     const imgs = [];
     for(const f of (opts.images||[])) imgs.push(await imageEnBase64(f));
-    const t = await appelAPI({ ...opts, images:imgs });
+    const t = await avecReprises(()=>appelAPI({ ...opts, images:imgs }));
     try{ return JSON.parse(t); }
     catch(e){
       const m = t.match(/[\{\[][\s\S]*[\}\]]/);
