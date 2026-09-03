@@ -313,6 +313,16 @@
   .creation b{display:block;font-size:15.5px;font-weight:650}
   .creation em{display:block;font-style:normal;font-size:13px;color:var(--texte-2);margin-top:2px}
 
+  /* plan de rangement */
+  .prop{display:flex;gap:11px;align-items:flex-start;padding:12px 13px;margin-bottom:8px;
+    background:var(--surface-2);border:1px solid var(--trait);border-radius:var(--r);cursor:pointer}
+  .prop:hover{border-color:var(--trait-fort)}
+  .prop input{margin-top:3px;width:17px;height:17px;accent-color:var(--accent);flex:none}
+  .prop span{flex:1;min-width:0}
+  .prop b{display:block;font-size:14.5px;font-weight:650}
+  .prop em{display:block;font-style:normal;font-size:13px;color:var(--texte-2);margin-top:3px}
+  .prop .note{display:block;margin-top:5px;font-size:12.5px}
+
   /* barre d'outils de saisie */
   .barre-saisie{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
   .barre-saisie .note{flex:1;min-width:120px}
@@ -2319,6 +2329,281 @@ async function preparerChapitre(cid){
   }catch(e){ ch.fini(); iaError(e); renderPanel(); }
 }
 
+/* =========================================================
+   RANGEMENT D'UNE MATIÈRE
+   Le classement fait à l'import est aveugle au reste : il ne voit que ce
+   qu'on lui donne. Après plusieurs imports, des chapitres se dédoublent et
+   des documents se retrouvent au mauvais endroit. Cette passe relit toute
+   la matière et propose un plan — jamais appliqué sans validation.
+
+   Deux temps, pour que la charge reste bornée quel que soit le volume :
+   d'abord consolider les chapitres (charge faible, vue d'ensemble), puis
+   replacer les documents par lots contre cette structure assainie.
+   ========================================================= */
+const SCHEMA_TRI_CHAP = {
+  type:"object",
+  properties:{
+    fusions:{ type:"array", items:{
+      type:"object",
+      properties:{ garder:{type:"string"}, absorber:{type:"array", items:{type:"string"}},
+                   titre:{type:"string"}, pourquoi:{type:"string"} },
+      required:["garder","absorber","titre","pourquoi"], additionalProperties:false }},
+    renommages:{ type:"array", items:{
+      type:"object",
+      properties:{ id:{type:"string"}, titre:{type:"string"}, pourquoi:{type:"string"} },
+      required:["id","titre","pourquoi"], additionalProperties:false }},
+    ordre:{ type:"array", items:{type:"string"} }
+  },
+  required:["fusions","renommages","ordre"], additionalProperties:false
+};
+
+const SCHEMA_TRI_DOCS = {
+  type:"object",
+  properties:{
+    deplacements:{ type:"array", items:{
+      type:"object",
+      properties:{ docId:{type:"string"}, versId:{type:"string"}, pourquoi:{type:"string"} },
+      required:["docId","versId","pourquoi"], additionalProperties:false }},
+    doublons:{ type:"array", items:{
+      type:"object",
+      properties:{ garder:{type:"string"}, supprimer:{type:"array", items:{type:"string"}}, pourquoi:{type:"string"} },
+      required:["garder","supprimer","pourquoi"], additionalProperties:false }}
+  },
+  required:["deplacements","doublons"], additionalProperties:false
+};
+
+const extraitDe = (it, n) => String(it.contenu||"")
+  .replace(/[#*=`>|\-]/g," ").replace(/\s+/g," ").trim().slice(0, n || 260);
+
+/* Déplacement manuel d'un document : pour le cas isolé, sans mobiliser l'IA. */
+function deplacerDoc(itemId){
+  const it = state.items.find(x=>x.id===itemId);
+  if(!it) return;
+  const cs = chapsOf(it.matiereId);
+  modal('<div class="modal-head"><h2>Déplacer le document</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><p class="note" style="margin-bottom:12px">« '+esc(it.titre||"sans titre")+' »</p>'
+    + '<div class="creation-liste">'
+    + cs.map(c=>'<button class="creation" data-vers="'+c.id+'"'+(c.id===it.chapitreId?' style="border-color:var(--accent)"':'')+'>'
+        + '<span class="creation-ic">'+esc(c.numero!=null?String(c.numero).padStart(2,"0"):"··")+"</span>"
+        + "<span><b>"+esc(c.titre)+"</b><em>"+itemsOf(c.id).length+" document"+(itemsOf(c.id).length>1?"s":"")
+        + (c.id===it.chapitreId?" · emplacement actuel":"")+"</em></span></button>").join("")
+    + "</div></div>");
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+  document.querySelectorAll("[data-vers]").forEach(b=>b.onclick=async()=>{
+    if(b.dataset.vers !== it.chapitreId){
+      it.chapitreId = b.dataset.vers;
+      it.maj = new Date().toISOString();
+      await saveItem(it);
+      toast("Déplacé vers « " + (chapById(b.dataset.vers)||{}).titre + " »");
+    }
+    closeModal();
+    aller("chapitre", { chap: it.chapitreId, mat: it.matiereId });
+  });
+}
+
+async function rangerMatiere(mid){
+  const m = matById(mid);
+  if(!m) return;
+  if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
+  const cs = chapsOf(mid), its = itemsOfMat(mid);
+  if(!cs.length && !its.length){ toast("Rien à ranger dans cette matière."); return; }
+
+  modal('<div class="modal-head"><h2>Ranger « '+esc(m.nom)+' »</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><div id="trEtat"></div><div id="trOut"></div></div>'
+    + '<div class="modal-foot"><button class="btn" data-x>Fermer</button>'
+    + '<button class="btn pri hide" id="trGo">Appliquer</button></div>', {wide:true, sticky:true});
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+
+  const ch = chantier($("#trEtat"), "Relecture de la matière", { delai: 300000 });
+  const plan = { fusions:[], renommages:[], ordre:[], deplacements:[], doublons:[] };
+
+  try{
+    /* ----- temps 1 : consolider les chapitres ----- */
+    if(cs.length > 1){
+      const inventaire = cs.map(c=>{
+        const titres = itemsOf(c.id).slice(0,6).map(i=>i.titre).join(" | ");
+        return '- id "'+c.id+'" · n°'+(c.numero||"?")+' · "'+c.titre+'"'
+          + " · " + itemsOf(c.id).length + " doc"
+          + (titres ? " · contient : " + titres : " · vide");
+      }).join("\n");
+
+      const r1 = await iaJson({
+        system: NIVEAU,
+        messages:[{ role:"user", content:
+          "Voici les chapitres de la matière « " + m.nom + " » d'un classeur de cours.\n\n" + inventaire + "\n\n"
+          + "Repère les défauts de structure et propose un plan de rangement :\n"
+          + "1. FUSIONS : deux chapitres qui désignent manifestement la même chose (« Amortissements » et « Les amortissements », "
+          + "ou un chapitre créé en double lors d'un import découpé). Indique lequel garder, lesquels absorber, et le titre final. "
+          + "Ne fusionne JAMAIS deux chapitres qui traitent de sujets distincts, même proches.\n"
+          + "2. RENOMMAGES : uniquement si un titre est manifestement tronqué, mal orthographié, ou porte un numéro de tranche "
+          + "parasite (« Partie 3 »). Sinon laisse le titre tel quel — c'est celui du professeur.\n"
+          + "3. ORDRE : la liste complète des id de chapitres, dans l'ordre pédagogique logique. Conserve l'ordre existant "
+          + "s'il est cohérent ; ne réordonne que si un chapitre est visiblement mal placé.\n\n"
+          + "Sois conservateur : en cas de doute, ne propose rien. Un classeur mal fusionné est pire qu'un classeur imparfait." }],
+        schema: SCHEMA_TRI_CHAP, effort:"high", maxTokens: 8000, signal: ch.signal
+      });
+      plan.fusions    = (r1 && r1.fusions) || [];
+      plan.renommages = (r1 && r1.renommages) || [];
+      plan.ordre      = (r1 && r1.ordre) || [];
+    }
+
+    /* ----- temps 2 : replacer les documents, par lots ----- */
+    if(its.length){
+      // Structure cible : après fusions et renommages proposés.
+      const absorbes = new Set();
+      plan.fusions.forEach(f=>(f.absorber||[]).forEach(a=>absorbes.add(a)));
+      const titreFinal = id => {
+        const f = plan.fusions.find(x=>x.garder === id);
+        if(f && f.titre) return f.titre;
+        const r = plan.renommages.find(x=>x.id === id);
+        if(r && r.titre) return r.titre;
+        const c = chapById(id); return c ? c.titre : "";
+      };
+      const cible = cs.filter(c=>!absorbes.has(c.id));
+      const listeCible = cible.map(c=>'- id "'+c.id+'" · "'+titreFinal(c.id)+'"').join("\n");
+
+      const LOT = 30;
+      for(let i = 0; i < its.length; i += LOT){
+        const lot = its.slice(i, i + LOT);
+        if($("#trEtat")) {
+          const t = $("#trEtat").querySelector(".thinking");
+          if(t) t.innerHTML = "<i></i>Placement des documents — " + Math.min(i+LOT, its.length) + "/" + its.length;
+        }
+        const desc = lot.map(it=>{
+          const actuel = absorbes.has(it.chapitreId) ? (plan.fusions.find(f=>(f.absorber||[]).includes(it.chapitreId))||{}).garder : it.chapitreId;
+          return '- doc "'+it.id+'" · type '+(TYPES[it.type]||it.type)+' · titre "'+(it.titre||"")+'"'
+            + ' · actuellement dans "'+(actuel||"aucun")+'" · extrait : ' + extraitDe(it);
+        }).join("\n");
+
+        const r2 = await iaJson({
+          system: NIVEAU,
+          messages:[{ role:"user", content:
+            "Chapitres disponibles dans la matière « " + m.nom + " » :\n" + listeCible + "\n\n"
+            + "Documents à vérifier :\n" + desc + "\n\n"
+            + "1. DÉPLACEMENTS : pour chaque document manifestement rangé dans le mauvais chapitre, indique son id "
+            + "et l'id du chapitre qui lui convient. N'utilise que les id de la liste ci-dessus. "
+            + "Ne propose RIEN pour un document déjà bien placé — la liste doit être courte.\n"
+            + "2. DOUBLONS : deux documents dont le contenu se recouvre presque entièrement (même page importée deux fois). "
+            + "Indique lequel garder et lesquels supprimer. Un cours et son exercice ne sont PAS des doublons ; "
+            + "deux séances distinctes non plus. En cas de doute, ne signale rien." }],
+          schema: SCHEMA_TRI_DOCS, effort:"high", maxTokens: 8000, signal: ch.signal
+        });
+        plan.deplacements = plan.deplacements.concat((r2 && r2.deplacements) || []);
+        plan.doublons     = plan.doublons.concat((r2 && r2.doublons) || []);
+      }
+    }
+
+    ch.fini();
+    ecranRangement(plan, mid);
+  }catch(e){
+    ch.fini();
+    $("#trEtat").innerHTML = '<b style="color:var(--alerte)">' + esc(msgErreur(e)) + "</b>";
+  }
+}
+
+function ecranRangement(plan, mid){
+  const nom = id => { const c = chapById(id); return c ? (c.numero!=null?"Ch. "+c.numero+" — ":"") + c.titre : "(chapitre inconnu)"; };
+  const doc = id => { const i = state.items.find(x=>x.id===id); return i ? (i.titre||"sans titre") : "(document inconnu)"; };
+  const valides = c => chapById(c);
+
+  const fusions = (plan.fusions||[]).filter(f=>valides(f.garder) && (f.absorber||[]).some(valides));
+  const renom   = (plan.renommages||[]).filter(r=>valides(r.id) && r.titre && chapById(r.id).titre !== r.titre);
+  const depl    = (plan.deplacements||[]).filter(d=>{
+    const it = state.items.find(x=>x.id===d.docId);
+    return it && valides(d.versId) && it.chapitreId !== d.versId;
+  });
+  const doubl   = (plan.doublons||[]).filter(d=>state.items.some(x=>x.id===d.garder) && (d.supprimer||[]).some(id=>state.items.some(x=>x.id===id)));
+  const ordreUtile = (plan.ordre||[]).filter(valides);
+  const ordreChange = ordreUtile.length > 1 &&
+    ordreUtile.join("|") !== chapsOf(mid).map(c=>c.id).join("|");
+
+  const total = fusions.length + renom.length + depl.length + doubl.length + (ordreChange?1:0);
+  $("#trEtat").innerHTML = total
+    ? "<b>" + total + " proposition" + (total>1?"s":"") + "</b> — décoche ce que tu refuses."
+    : "<b>Rien à redresser.</b> La matière est déjà bien rangée.";
+
+  if(!total){ $("#trOut").innerHTML = ""; return; }
+
+  const ligne = (cle, titre, detail, pourquoi) =>
+    '<label class="prop"><input type="checkbox" checked data-act="'+cle+'">'
+    + "<span><b>"+titre+"</b>"
+    + (detail ? "<em>"+detail+"</em>" : "")
+    + (pourquoi ? '<span class="note">'+esc(pourquoi)+"</span>" : "")
+    + "</span></label>";
+
+  let html = "";
+  if(fusions.length){
+    html += '<div class="titre-section"><h2>Chapitres en double</h2></div>';
+    fusions.forEach((f,i)=>{
+      const abs = (f.absorber||[]).filter(valides);
+      html += ligne("fus:"+i, "Fusionner en « "+esc(f.titre||chapById(f.garder).titre)+" »",
+        esc(abs.map(nom).join(" + ")) + " → " + esc(nom(f.garder)), f.pourquoi);
+    });
+  }
+  if(renom.length){
+    html += '<div class="titre-section"><h2>Titres à corriger</h2></div>';
+    renom.forEach((r,i)=>html += ligne("ren:"+i, esc(chapById(r.id).titre)+" → "+esc(r.titre), "", r.pourquoi));
+  }
+  if(depl.length){
+    html += '<div class="titre-section"><h2>Documents mal rangés</h2></div>';
+    depl.forEach((d,i)=>html += ligne("dep:"+i, esc(doc(d.docId)),
+      esc(nom(state.items.find(x=>x.id===d.docId).chapitreId)) + " → " + esc(nom(d.versId)), d.pourquoi));
+  }
+  if(doubl.length){
+    html += '<div class="titre-section"><h2>Doublons</h2></div>';
+    doubl.forEach((d,i)=>{
+      const sup = (d.supprimer||[]).filter(id=>state.items.some(x=>x.id===id));
+      html += ligne("dbl:"+i, "Supprimer " + sup.length + " copie" + (sup.length>1?"s":""),
+        esc(sup.map(doc).join(", ")) + " · garde « " + esc(doc(d.garder)) + " »", d.pourquoi);
+    });
+  }
+  if(ordreChange){
+    html += '<div class="titre-section"><h2>Ordre des chapitres</h2></div>';
+    html += ligne("ord:0", "Renuméroter les chapitres",
+      esc(ordreUtile.map(id=>chapById(id).titre).join(" → ")), "");
+  }
+
+  $("#trOut").innerHTML = html;
+  $("#trGo").classList.remove("hide");
+  $("#trGo").onclick = async ()=>{
+    const coche = c => { const e = document.querySelector('[data-act="'+c+'"]'); return e && e.checked; };
+    let n = 0;
+
+    for(let i=0;i<fusions.length;i++){
+      if(!coche("fus:"+i)) continue;
+      const f = fusions[i], abs = (f.absorber||[]).filter(valides);
+      for(const a of abs){
+        for(const it of itemsOf(a)){ it.chapitreId = f.garder; await saveItem(it); }
+        state.chapitres = state.chapitres.filter(c=>c.id !== a);
+      }
+      const g = chapById(f.garder); if(g && f.titre) g.titre = f.titre;
+      n++;
+    }
+    for(let i=0;i<renom.length;i++){
+      if(!coche("ren:"+i)) continue;
+      const c = chapById(renom[i].id); if(c){ c.titre = renom[i].titre; n++; }
+    }
+    for(let i=0;i<depl.length;i++){
+      if(!coche("dep:"+i)) continue;
+      const it = state.items.find(x=>x.id===depl[i].docId);
+      if(it && chapById(depl[i].versId)){ it.chapitreId = depl[i].versId; await saveItem(it); n++; }
+    }
+    for(let i=0;i<doubl.length;i++){
+      if(!coche("dbl:"+i)) continue;
+      for(const id of (doubl[i].supprimer||[])) if(state.items.some(x=>x.id===id)){ await deleteItem(id); n++; }
+    }
+    if(ordreChange && coche("ord:0")){
+      ordreUtile.forEach((id,k)=>{ const c = chapById(id); if(c) c.numero = k+1; });
+      n++;
+    }
+
+    await saveStructure();
+    closeModal();
+    aller("matiere", { mat: mid });
+    toast(n ? n + " changement(s) appliqué(s)" : "Aucun changement");
+  };
+}
+
 /* ---------- réglages ---------- */
 function openSettings(){
   const nb = state.items.length, poids = Math.round(JSON.stringify(state.items).length/1024);
@@ -2739,6 +3024,7 @@ function vueMatiere(){
     +   '<button class="btn pri sm" data-import="1">＋ Importer</button>'
     +   '<button class="btn sm" data-ecrire="">✎ Écrire</button>'
     +   '<button class="btn sm" data-programme="1">☰ Programme</button>'
+    +   '<button class="btn sm" data-ranger="1">⇄ Ranger</button>'
     +   '<button class="btn sm" data-newchap="1">Chapitre</button>'
     +   '<button class="btn sm fantome" data-editmat="1">Modifier</button>'
     + "</div>"
@@ -2839,6 +3125,7 @@ function vueChapitre(){
                     + "</p>"
                     + '<div class="doc-actions">'
                     +   '<button class="btn sm" data-edit="'+i.id+'">Modifier</button>'
+                    +   '<button class="btn sm" data-deplacer="'+i.id+'">Déplacer</button>'
                     +   '<button class="btn sm" data-expliquer="'+i.id+'">Expliquer</button>'
                     +   '<button class="btn sm" data-fiche="'+i.id+'">Fiche</button>'
                     +   '<button class="btn sm fantome danger" data-del="'+i.id+'">Supprimer</button>'
@@ -3052,6 +3339,8 @@ function câbler(scene){
   });
   q("[data-newchap]").forEach(b=>b.onclick=()=>openChapModal(null));
   q("[data-programme]").forEach(b=>b.onclick=()=>openProgramme(state.selMat));
+  q("[data-ranger]").forEach(b=>b.onclick=()=>rangerMatiere(state.selMat));
+  q("[data-deplacer]").forEach(b=>b.onclick=()=>deplacerDoc(b.dataset.deplacer));
   q("[data-preparer]").forEach(b=>b.onclick=()=>preparerChapitre(b.dataset.preparer));
   q("[data-editmat]").forEach(b=>b.onclick=openMatieresModal);
   q("[data-editchap]").forEach(b=>b.onclick=()=>openChapModal(b.dataset.editchap));
