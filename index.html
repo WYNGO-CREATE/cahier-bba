@@ -321,6 +321,10 @@
   .creation b{display:block;font-size:15.5px;font-weight:650}
   .creation em{display:block;font-style:normal;font-size:13px;color:var(--texte-2);margin-top:2px}
 
+  /* barre d'outils de saisie */
+  .barre-saisie{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
+  .barre-saisie .note{flex:1;min-width:120px}
+
   .drop{border:1.5px dashed var(--trait-fort);border-radius:16px;padding:30px 20px;text-align:center;
     background:var(--surface-2);transition:border-color .15s,background .15s}
   .drop.hot{border-color:var(--accent);background:var(--accent-doux)}
@@ -1552,9 +1556,12 @@ async function delChapitre(cid){
 function openEditor(opts){
   opts = opts || {};
   const it  = opts.itemId ? state.items.find(x=>x.id===opts.itemId) : null;
-  const mid = it ? it.matiereId : (opts.chapitreId ? chapById(opts.chapitreId).matiereId : state.selMat);
+  const chapDemande = opts.chapitreId ? chapById(opts.chapitreId) : null;
+  const mid = it ? it.matiereId : (chapDemande ? chapDemande.matiereId : state.selMat);
   if(!mid && !state.matieres.length){ openMatieresModal(); return; }
-  const cid = it ? it.chapitreId : (opts.chapitreId || (state.selChap && chapById(state.selChap) && chapById(state.selChap).matiereId===mid ? state.selChap : ""));
+  const cid = it ? it.chapitreId
+    : (chapDemande ? chapDemande.id
+       : (state.selChap && chapById(state.selChap) && chapById(state.selChap).matiereId === mid ? state.selChap : ""));
 
   modal('<div class="modal-head"><h2>'+(it?"Modifier le document":"Écrire un cours")+'</h2>'
     + '<span class="note" id="edState"></span><button class="btn ghost sm" data-x>✕</button></div>'
@@ -1570,7 +1577,14 @@ function openEditor(opts){
     +   Object.keys(TYPES).map(k=>'<button type="button" data-t="'+k+'" aria-pressed="'+((it?it.type:"cours")===k)+'">'+TYPES[k]+"</button>").join("")+"</div></div>"
     + '<div><label class="lab" for="eTi">Titre</label><input class="field" id="eTi" value="'+esc(it?it.titre:"")+'" placeholder="Séance du 12 septembre — Introduction"></div>'
     + '<div><label class="lab" for="eB">Contenu <span style="text-transform:none;letter-spacing:0">— markdown : ## titre, - liste, **gras**, ==surligné==</span></label>'
-    +   '<textarea class="field" id="eB" rows="14" style="font-size:13.5px">'+esc(it?it.contenu:"")+"</textarea></div>"
+    +   '<div class="barre-saisie">'
+    +     '<button type="button" class="btn sm" id="ePhoto">▣ Insérer une photo ici</button>'
+    +     '<span class="note" id="ePhotoEtat"></span>'
+    +     '<input type="file" id="ePhotoIn" multiple accept="image/*" class="sr">'
+    +   "</div>"
+    +   '<textarea class="field" id="eB" rows="14" style="font-size:13.5px">'+esc(it?it.contenu:"")+"</textarea>"
+    +   '<p class="note" style="margin-top:6px">La photo est lue puis retranscrite <b>à l\'endroit du curseur</b>. '
+    +   "Sélectionne plusieurs photos : elles sont insérées l'une après l'autre, dans l'ordre où tu les choisis.</p></div>"
     + "</div></div>"
     + '<div class="modal-foot"><button class="btn" id="eClean">✦ Mettre au propre</button><div style="flex:1"></div>'
     + '<button class="btn" data-x>Annuler</button><button class="btn pri" id="eSave">Enregistrer</button></div>', {wide:true, sticky:true});
@@ -1594,6 +1608,71 @@ function openEditor(opts){
   });
   document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
   $(it ? "#eB" : "#eTi").focus();
+
+  /* ----- insertion d'une photo au fil de la frappe -----
+     La retranscription se range à l'endroit du curseur, et les photos
+     multiples s'enchaînent dans l'ordre choisi : c'est ce qui fait la
+     différence entre un cours suivi et des bouts de texte jetés. */
+  $("#ePhoto").onclick = ()=>{
+    if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
+    if(!IA.vision){ toast("La lecture des photos n'est pas active — voir Réglages.", 4000); return; }
+    $("#ePhotoIn").click();
+  };
+
+  $("#ePhotoIn").onchange = async ()=>{
+    const photos = Array.from($("#ePhotoIn").files || []);
+    $("#ePhotoIn").value = "";
+    if(!photos.length) return;
+
+    const ta = $("#eB"), btn = $("#ePhoto"), etat = $("#ePhotoEtat");
+    btn.disabled = true;
+
+    // Le point d'insertion est figé maintenant : le curseur ne doit pas
+    // sauter si l'étudiant clique ailleurs pendant la lecture.
+    let pos = ta.selectionStart != null ? ta.selectionStart : ta.value.length;
+
+    for(let i = 0; i < photos.length; i++){
+      const ch = chantier(etat, "Photo " + (i+1) + "/" + photos.length, { delai: 120000 });
+      try{
+        const texte = await iaTexte({
+          system: NIVEAU,
+          messages: [{ role:"user", content:
+            "Cette image est une page de notes de cours, un polycopié, un tableau ou une slide.\n"
+            + "Retranscris-la intégralement en markdown : tout le texte, les titres, la numérotation, "
+            + "les définitions, les formules (en LaTeX entre $…$), les tableaux (en markdown). "
+            + "Décris un schéma en une phrase entre crochets. Marque `[illisible]` là où tu n'es pas sûr.\n"
+            + "Ne résume pas, n'ajoute aucun commentaire, ne mets ni introduction ni conclusion : "
+            + "renvoie uniquement le contenu de la page, prêt à s'insérer au milieu d'un cours." }],
+          images: [photos[i]], effort: "medium", maxTokens: 8000, signal: ch.signal
+        });
+        ch.fini();
+
+        const propre = String(texte).trim();
+        if(!propre) continue;
+
+        const avant = ta.value.slice(0, pos), apres = ta.value.slice(pos);
+        const sep1 = avant && !avant.endsWith("\n\n") ? (avant.endsWith("\n") ? "\n" : "\n\n") : "";
+        const sep2 = apres && !apres.startsWith("\n") ? "\n\n" : "";
+        const morceau = sep1 + propre + sep2;
+
+        ta.value = avant + morceau + apres;
+        pos += morceau.length;                 // la photo suivante se pose après celle-ci
+        ta.selectionStart = ta.selectionEnd = pos;
+        ta.focus();
+        ta.scrollTop = ta.scrollHeight;
+      }catch(e){
+        ch.fini();
+        etat.innerHTML = '<b style="color:var(--alerte)">' + esc(msgErreur(e)) + "</b>";
+        btn.disabled = false;
+        return;
+      }
+    }
+
+    etat.textContent = photos.length > 1
+      ? photos.length + " photos insérées dans l'ordre"
+      : "Photo insérée";
+    btn.disabled = false;
+  };
 
   $("#eClean").onclick = async ()=>{
     const brut = $("#eB").value.trim();
@@ -2508,7 +2587,7 @@ function vueMatiere(){
         : "")
     + '<div class="doc-actions" style="margin:6px 0 4px">'
     +   '<button class="btn pri sm" data-import="1">＋ Importer</button>'
-    +   '<button class="btn sm" data-ecrire="1">✎ Écrire</button>'
+    +   '<button class="btn sm" data-ecrire="">✎ Écrire</button>'
     +   '<button class="btn sm" data-programme="1">☰ Programme</button>'
     +   '<button class="btn sm" data-newchap="1">Chapitre</button>'
     +   '<button class="btn sm fantome" data-editmat="1">Modifier</button>'
@@ -2817,7 +2896,10 @@ function câbler(scene){
     render();
   });
   q("[data-import]").forEach(b=>b.onclick=()=>openImport());
-  q("[data-ecrire]").forEach(b=>b.onclick=()=>openEditor(b.dataset.ecrire ? {chapitreId:b.dataset.ecrire} : {}));
+  q("[data-ecrire]").forEach(b=>b.onclick=()=>{
+    const cid = b.dataset.ecrire;
+    openEditor(cid && chapById(cid) ? { chapitreId: cid } : {});
+  });
   q("[data-newchap]").forEach(b=>b.onclick=()=>openChapModal(null));
   q("[data-programme]").forEach(b=>b.onclick=()=>openProgramme(state.selMat));
   q("[data-preparer]").forEach(b=>b.onclick=()=>preparerChapitre(b.dataset.preparer));
