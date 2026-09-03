@@ -925,6 +925,9 @@ async function appelGemini(o, essais){
     return await appelGeminiBrut(o);
   }catch(brut){
     const e = normErreur(brut);
+    if(e && e.code === "pensee_obligatoire" && !o.sansPensee){
+      return appelGemini({ ...o, sansPensee:true }, essais);
+    }
     if(e && e.code === "modele_inconnu" && essais < 4 && await reparerModele()){
       return appelGemini(o, essais + 1);
     }
@@ -932,7 +935,7 @@ async function appelGemini(o, essais){
   }
 }
 
-async function appelGeminiBrut({ system, messages, images, maxTokens, schema, onText, signal, recherche, sources }){
+async function appelGeminiBrut({ system, messages, images, maxTokens, schema, onText, signal, recherche, sources, effort, sansPensee }){
   const parts = [];
   for(const im of (images||[])) parts.push({ inline_data:{ mime_type: im.media, data: im.b64 } });
 
@@ -947,6 +950,10 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
     contents,
     generationConfig: { maxOutputTokens: maxTokens || 8192 }
   };
+  // Les modèles Gemini récents réfléchissent avant d'écrire, et cette phase
+  // est invisible : l'écran reste vide longtemps. Pour une extraction, elle
+  // n'apporte rien — on la coupe et la réponse arrive tout de suite.
+  if(effort === "low" && !sansPensee) body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
   if(system) body.systemInstruction = { parts:[{ text: system }] };
   // La recherche web et le schéma JSON s'excluent chez Google : quand on
   // veut des sources, on accepte du texte libre et on cite en fin de réponse.
@@ -984,6 +991,11 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
     if(recherche && /tool|google_?search|grounding|function/i.test(msg)){
       const e2 = new Error(msg || ("HTTP "+res.status));
       e2.code = "recherche_refusee"; throw e2;
+    }
+    // Certains modèles refusent qu'on coupe leur réflexion : on la rétablit.
+    if(!sansPensee && /thinking|thought|budget/i.test(msg)){
+      const e2 = new Error(msg || ("HTTP "+res.status));
+      e2.code = "pensee_obligatoire"; throw e2;
     }
     const modeleRefuse = /only supports|not supported for|is not supported|does not support/i.test(msg);
     err.code = res.status === 404 || modeleRefuse ? "modele_inconnu"
@@ -1136,7 +1148,9 @@ function chantier(cible, libelle, opts){
     if(!cible || !cible.isConnected) return;
     const s = Math.round((Date.now() - t0) / 1000);
     cible.innerHTML = '<span class="thinking"><i></i>' + esc(libelle) + " — " + s + " s</span> "
-      + '<button class="btn sm fantome" data-stop="1">Annuler</button>';
+      + '<button class="btn sm fantome" data-stop="1">Annuler</button>'
+      + (s >= 20 ? '<p class="note" style="margin-top:8px">Le modèle réfléchit avant d\'écrire : '
+          + "rien ne s'affiche tant qu'il n'a pas commencé. C'est normal jusqu'à une minute environ.</p>" : "");
     const b = cible.querySelector("[data-stop]");
     if(b) b.onclick = ()=>ctl.abort();
   };
@@ -1315,6 +1329,7 @@ async function analyseChapitre(cid){
       resume: a.resume||"", plan: a.plan||[], notions: a.notions||[],
       lacunes: a.lacunes||[], questions: a.questions||[],
       date: new Date().toLocaleDateString("fr-FR",{day:"2-digit",month:"short",year:"numeric"})
+             + " à " + new Date().toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})
     };
     await saveStructure(); render();
     toast(c.analyse.lacunes.length ? c.analyse.lacunes.length+" point(s) à compléter repéré(s)" : "Chapitre analysé — rien ne manque");
@@ -1608,12 +1623,17 @@ function openEditor(opts){
       const nc = { id:uid(), matiereId:selM.value, titre:t, numero:num, statut:"encours", note:"" };
       state.chapitres.push(nc); chapId = nc.id; await saveStructure();
     }
-    const titre = $("#eTi").value.trim() || (TYPES[type]+" — "+new Date().toLocaleDateString("fr-FR"));
+    const maintenant = new Date();
+    const titre = $("#eTi").value.trim()
+      || (TYPES[type] + " — " + maintenant.toLocaleDateString("fr-FR", { day:"2-digit", month:"2-digit" })
+          + " à " + maintenant.toLocaleTimeString("fr-FR", { hour:"2-digit", minute:"2-digit" }));
     if(it){
       it.titre=titre; it.contenu=contenu; it.type=type; it.matiereId=selM.value; it.chapitreId=chapId;
+      it.maj = maintenant.toISOString();
       await saveItem(it);
     }else{
-      const nit = { id:uid(), matiereId:selM.value, chapitreId:chapId, type, titre, contenu, source:"texte", date:new Date().toISOString() };
+      const nit = { id:uid(), matiereId:selM.value, chapitreId:chapId, type, titre, contenu,
+        source:"texte", date: maintenant.toISOString() };
       state.items.push(nit); await saveItem(nit); state.openDocs.add(nit.id);
     }
     state.selMat = selM.value; state.openChaps.add(chapId);
@@ -2342,11 +2362,26 @@ function rangeeMatieres(){
     + "</div></div>";
 }
 
+/* Horodatage : chaque note porte son jour ET son heure de prise. */
+const HEURE = { hour:"2-digit", minute:"2-digit" };
+
+const heureDe = iso => {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleTimeString("fr-FR", HEURE);
+};
+const dateHeure = iso => {
+  const d = new Date(iso);
+  if(isNaN(d)) return "";
+  return d.toLocaleDateString("fr-FR", { weekday:"long", day:"numeric", month:"long" })
+    + " à " + d.toLocaleTimeString("fr-FR", HEURE);
+};
 const ilYA = iso => {
   const d = new Date(iso); if(isNaN(d)) return "";
-  const j = Math.floor((Date.now() - d.getTime()) / 86400000);
-  if(j <= 0) return "aujourd'hui";
-  if(j === 1) return "hier";
+  const auj = new Date(), hier = new Date(auj.getTime() - 86400000);
+  const memeJour = (a,b) => a.toDateString() === b.toDateString();
+  if(memeJour(d, auj))  return "aujourd'hui à " + d.toLocaleTimeString("fr-FR", HEURE);
+  if(memeJour(d, hier)) return "hier à " + d.toLocaleTimeString("fr-FR", HEURE);
+  const j = Math.floor((auj - d) / 86400000);
   if(j < 7) return "il y a " + j + " j";
   return d.toLocaleDateString("fr-FR", { day:"2-digit", month:"short" });
 };
@@ -2545,10 +2580,13 @@ function vueChapitre(){
         ? '<div class="fil">' + its.map(i=>{
             const ouvert = state.openDocs.has(i.id);
             const d = i.date ? new Date(i.date) : null;
+            const jourHeure = d && !isNaN(d)
+              ? d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"}) + " · " + heureDe(i.date)
+              : "";
             return '<div class="doc"><button class="doc-tete" data-doc="'+i.id+'" aria-expanded="'+ouvert+'">'
               + '<span class="etiq type">'+esc(TYPES[i.type]||i.type||"doc")+"</span>"
               + "<h4>"+esc(i.titre||"Sans titre")+"</h4>"
-              + '<span class="doc-date">'+(d&&!isNaN(d)?d.toLocaleDateString("fr-FR",{day:"2-digit",month:"2-digit"}):"")+"</span>"
+              + '<span class="doc-date">'+jourHeure+"</span>"
               + "<span class='chevron' style='transform:rotate("+(ouvert?90:0)+"deg)'>›</span></button>"
               + (ouvert
                   ? '<div class="doc-corps">'
@@ -2558,6 +2596,10 @@ function vueChapitre(){
                           + " Ce n'est pas le cours de ton professeur : confronte-le à ce qui sera dit en amphi.</div>"
                         : "")
                     + '<div class="prose">'+md(i.contenu)+"</div>"
+                    + '<p class="note" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--trait)">'
+                    +   "Noté le " + esc(dateHeure(i.date))
+                    +   (i.maj && i.maj !== i.date ? " · modifié le " + esc(dateHeure(i.maj)) : "")
+                    + "</p>"
                     + '<div class="doc-actions">'
                     +   '<button class="btn sm" data-edit="'+i.id+'">Modifier</button>'
                     +   '<button class="btn sm" data-expliquer="'+i.id+'">Expliquer</button>'
