@@ -1728,11 +1728,99 @@ function openEditor(opts){
   };
 }
 
+/* =========================================================
+   LECTURE DES PDF
+   Un poly de cours porte presque toujours une couche de texte : on
+   l'extrait, c'est instantané, gratuit et fidèle au caractère près.
+   La lecture d'image, coûteuse, est réservée aux pages réellement
+   scannées — celles où l'extraction ne rend rien.
+   ========================================================= */
+const PDFJS_VERSION = "3.11.174";
+const PDFJS_BASE = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/" + PDFJS_VERSION + "/";
+let pdfjsPromesse = null;
+
+function chargerPDFJS(){
+  if(pdfjsPromesse) return pdfjsPromesse;
+  pdfjsPromesse = new Promise((ok, ko)=>{
+    if(window.pdfjsLib){ ok(window.pdfjsLib); return; }
+    const s = document.createElement("script");
+    s.src = PDFJS_BASE + "pdf.min.js";
+    s.onload = ()=>{
+      if(!window.pdfjsLib){ ko(Object.assign(new Error("bibliothèque PDF illisible"), {code:"pdf_indispo"})); return; }
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_BASE + "pdf.worker.min.js";
+      ok(window.pdfjsLib);
+    };
+    s.onerror = ()=>{
+      pdfjsPromesse = null;
+      ko(Object.assign(new Error("lecteur PDF inaccessible — vérifie ta connexion"), {code:"pdf_indispo"}));
+    };
+    document.head.appendChild(s);
+  });
+  return pdfjsPromesse;
+}
+
+/* Une page dont l'extraction rend moins de 40 caractères utiles est
+   considérée comme scannée : c'est le seuil qui sépare un poly numérique
+   d'une photocopie. */
+const SEUIL_PAGE_VIDE = 40;
+
+async function lirePDF(file, { signal, onEtat } = {}){
+  const lib = await chargerPDFJS();
+  const doc = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
+  const pages = [];
+  for(let i = 1; i <= doc.numPages; i++){
+    if(signal && signal.aborted) throw Object.assign(new Error("interrompu"), { code:"delai_depasse" });
+    if(onEtat) onEtat(i, doc.numPages);
+    const page = await doc.getPage(i);
+    const contenu = await page.getTextContent();
+    const texte = contenu.items.map(x=>x.str).join(" ").replace(/[ \t]+/g, " ").trim();
+    pages.push(texte.length >= SEUIL_PAGE_VIDE
+      ? { num:i, texte, scan:false }
+      : { num:i, texte:"", scan:true, page });
+  }
+  return { nom: file.name, pages, total: doc.numPages,
+           scannees: pages.filter(p=>p.scan).length };
+}
+
+/* Rendu d'une page scannée en image, puis lecture par l'IA. */
+async function ocrPagePDF(page, signal){
+  const vp = page.getViewport({ scale: 2 });
+  const c = document.createElement("canvas");
+  c.width = Math.min(vp.width, 2000);
+  c.height = Math.round(vp.height * (c.width / vp.width));
+  await page.render({ canvasContext: c.getContext("2d"),
+    viewport: page.getViewport({ scale: 2 * (c.width / vp.width) }) }).promise;
+  const blob = await new Promise(r=>c.toBlob(r, "image/jpeg", 0.85));
+  return iaTexte({
+    system: NIVEAU,
+    messages: [{ role:"user", content:
+      "Cette image est une page de document de cours scannée. Retranscris-la intégralement en markdown : "
+      + "texte, titres, numérotation, formules (LaTeX entre $…$), tableaux. Marque `[illisible]` si besoin. "
+      + "Aucun commentaire, aucune introduction : uniquement le contenu de la page." }],
+    images: [blob], effort: "low", maxTokens: 8000, signal
+  });
+}
+
+/* Découpe un long texte en tranches, sans couper au milieu d'un paragraphe. */
+function decouper(texte, taille){
+  const morceaux = [];
+  let reste = texte;
+  while(reste.length > taille){
+    let coupe = reste.lastIndexOf("\n\n", taille);
+    if(coupe < taille * 0.5) coupe = reste.lastIndexOf("\n", taille);
+    if(coupe < taille * 0.5) coupe = taille;
+    morceaux.push(reste.slice(0, coupe));
+    reste = reste.slice(coupe);
+  }
+  if(reste.trim()) morceaux.push(reste);
+  return morceaux;
+}
+
 /* ---------- import photos / fichiers ---------- */
 const TXT_EXT = /\.(txt|md|markdown|csv|tsv|json|rtf)$/i;
 
 function openImport(){
-  const accept = (imgLim && imgLim.mediaTypes ? imgLim.mediaTypes.join(",") : "image/*") + ",.txt,.md,.csv,.tsv,.json";
+  const accept = (imgLim && imgLim.mediaTypes ? imgLim.mediaTypes.join(",") : "image/*") + ",.pdf,.txt,.md,.csv,.tsv,.json";
   const maxN = IA.mode === "api" ? 12 : (imgLim ? imgLim.maxCount : MAX_IMG_DEFAUT);
 
   modal('<div class="modal-head"><h2>Importer des documents</h2><button class="btn ghost sm" data-x>✕</button></div>'
@@ -1741,9 +1829,9 @@ function openImport(){
     +   state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===state.selMat?" selected":"")+">"+esc(m.nom)+"</option>").join("")+"</select></div>"
     + (IA.vision
         ? '<div class="drop" id="drop" tabindex="0" role="button">'
-          +   '<div style="font-family:var(--serif);font-size:17px">Dépose tes photos ici</div>'
-          +   '<p class="note" style="margin-top:6px">ou <u>clique pour choisir</u> — jusqu\'à '+maxN+' images par analyse. '
-          +   'Fichiers texte (.txt, .md, .csv) acceptés aussi.</p>'
+          +   '<div style="font-family:var(--serif);font-size:17px">Dépose tes photos ou tes PDF</div>'
+          +   '<p class="note" style="margin-top:6px">ou <u>clique pour choisir</u> — jusqu\'à '+maxN+' photos par analyse, '
+          +   'et autant de PDF que tu veux, même longs. Fichiers texte acceptés aussi.</p>'
           +   '<input type="file" id="files" multiple accept="'+esc(accept)+'" class="sr">'
           + "</div>"
         : '<div class="card" style="border-color:var(--warn)"><h4 style="color:var(--warn)">Lecture des photos inactive</h4>'
@@ -1823,22 +1911,61 @@ const SCHEMA_IMPORT = {
 
 async function lancerImport(files, mid, hint, maxN, colle){
   if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir ⚙ Réglages."); return; }
+  const estPDF = f => /\.pdf$/i.test(f.name) || f.type === "application/pdf";
   const imgs = files.filter(f=>f.type.startsWith("image/"));
-  const txts = files.filter(f=>!f.type.startsWith("image/"));
-  if(imgs.length && !IA.vision && !colle){
+  const pdfs = files.filter(estPDF);
+  const txts = files.filter(f=>!f.type.startsWith("image/") && !estPDF(f));
+  if(imgs.length && !IA.vision && !colle && !pdfs.length){
     toast("La lecture des photos n'est pas active ici — voir ⚙ Réglages.", 4500); return;
   }
   if(imgs.length > maxN){ toast("Maximum "+maxN+" images par analyse — retires-en quelques-unes."); return; }
 
+  const btn = $("#iGo"); btn.disabled = true;
+  const ch = chantier($("#iState"), "Lecture des documents", { delai: 600000 });
+
   let annexes = "";
   for(const f of txts){
-    if(!TXT_EXT.test(f.name) && !f.type.startsWith("text/")){ toast("Format non lisible : "+f.name+" — exporte-le en images."); continue; }
+    if(!TXT_EXT.test(f.name) && !f.type.startsWith("text/")){ toast("Format non lisible : "+f.name); continue; }
     try{ annexes += "\n\n=== FICHIER JOINT : "+f.name+" ===\n" + (await f.text()).slice(0,18000); }catch(e){}
   }
 
-  const btn = $("#iGo"); btn.disabled = true;
-  $("#iState").innerHTML = '<span class="thinking"><i></i>Lecture des documents…</span>';
-  $("#iOut").innerHTML = '<div class="card"><p class="note">L\'agent lit chaque page, retranscrit intégralement et identifie de quel chapitre il s\'agit. 30 à 90 secondes.</p></div>';
+  /* ----- PDF : couche de texte d'abord, lecture d'image en dernier ----- */
+  let textePDF = "", bilanPDF = [];
+  try{
+    for(const f of pdfs){
+      const lu = await lirePDF(f, { signal: ch.signal,
+        onEtat: (i,n)=>{ const e=$("#iState"); if(e && e.querySelector(".thinking"))
+          e.querySelector(".thinking").innerHTML = "<i></i>" + esc(f.name) + " — page " + i + "/" + n; } });
+
+      const aOCR = lu.pages.filter(p=>p.scan);
+      if(aOCR.length && IA.vision){
+        const plafond = Math.min(aOCR.length, 25);
+        for(let k = 0; k < plafond; k++){
+          const e = $("#iState");
+          if(e && e.querySelector(".thinking"))
+            e.querySelector(".thinking").innerHTML = "<i></i>" + esc(f.name)
+              + " — page scannée " + (k+1) + "/" + plafond + " (lecture d'image)";
+          try{ aOCR[k].texte = await ocrPagePDF(aOCR[k].page, ch.signal); }catch(e2){ aOCR[k].texte = ""; }
+        }
+      }
+
+      const utiles = lu.pages.filter(p=>p.texte);
+      textePDF += "\n\n=== DOCUMENT : " + f.name + " ===\n"
+        + utiles.map(p=>"\n[page " + p.num + "]\n" + p.texte).join("\n");
+      bilanPDF.push(f.name + " : " + lu.total + " page" + (lu.total>1?"s":"")
+        + (lu.scannees ? ", dont " + lu.scannees + " scannée" + (lu.scannees>1?"s":"") : ""));
+    }
+  }catch(e){
+    ch.fini();
+    $("#iState").innerHTML = '<b style="color:var(--alerte)">' + esc(
+      e && e.code === "pdf_indispo" ? e.message : msgErreur(e)) + "</b>";
+    btn.disabled = false;
+    return;
+  }
+
+  $("#iOut").innerHTML = bilanPDF.length
+    ? '<div class="card"><h4>PDF lus</h4><p class="note">' + esc(bilanPDF.join(" · ")) + "</p></div>"
+    : '<div class="card"><p class="note">L\'agent lit chaque page, retranscrit intégralement et identifie de quel chapitre il s\'agit.</p></div>';
 
   const m = matById(mid), cs = chapsOf(mid);
   const liste = cs.length ? cs.map(c=>'- id "'+c.id+'" · Ch. '+(c.numero||"?")+" — "+c.titre).join("\n") : "(aucun chapitre existant)";
@@ -1861,35 +1988,66 @@ async function lancerImport(files, mid, hint, maxN, colle){
     + '"chapitreTitre":"titre du chapitre (existant ou proposé)","chapitreNumero":3,'
     + '"pages":"1-2","transcription":"le document complet en markdown","concepts":["notion 1"],"incertitudes":["passage illisible ou douteux"]}]}';
 
-  const appeler = withImages => iaJson({
+  const appeler = (withImages, tranche, dejaProposes) => iaJson({
     system: NIVEAU,
-    messages: [{ role:"user", content: prompt }],
+    messages: [{ role:"user", content: prompt
+      + (tranche ? "\n\nTEXTE EXTRAIT DES PDF (tranche à traiter) :\n" + tranche + "\n" : "")
+      + (dejaProposes && dejaProposes.length
+          ? "\nChapitres déjà proposés pour les tranches précédentes de ce même document — "
+            + "réutilise exactement ces titres quand le contenu s'y rattache, au lieu d'en créer des variantes :\n- "
+            + dejaProposes.join("\n- ") + "\n"
+          : "") }],
     images: withImages ? imgs : null,
     schema: SCHEMA_IMPORT,
     effort: "medium",
-    maxTokens: 32000
+    maxTokens: 32000,
+    signal: ch.signal
   });
 
   try{
-    let res;
-    try{
-      res = await appeler(avecImages);
-    }catch(e){
-      if(e && e.code === "images_unavailable" && avecImages){
-        imagesKO = true; majMode();
-        if(colle || annexes){
-          $("#iState").innerHTML = '<span class="thinking"><i></i>Photos refusées — reprise sur le texte seul…</span>';
-          res = await appeler(false);
-        }else{
-          throw e;
+    let docs = [];
+
+    if(textePDF.trim()){
+      // Un poly de 80 pages dépasse largement ce qu'un seul appel peut lire :
+      // on le traite par tranches, en transmettant les chapitres déjà proposés
+      // pour que le découpage reste cohérent d'une tranche à l'autre.
+      const tranches = decouper(textePDF.trim(), 28000);
+      const proposes = [];
+      for(let i = 0; i < tranches.length; i++){
+        const e = $("#iState");
+        if(e) e.innerHTML = '<span class="thinking"><i></i>Classement — tranche ' + (i+1)
+          + "/" + tranches.length + "</span>";
+        const r = await appeler(i === 0 && avecImages, tranches[i], proposes);
+        for(const d of (r && r.documents) || []){
+          docs.push(d);
+          const t = String(d.chapitreTitre || "").trim();
+          if(t && proposes.indexOf(t) < 0) proposes.push(t);
         }
-      }else throw e;
+      }
+    }else{
+      let res;
+      try{
+        res = await appeler(avecImages);
+      }catch(e){
+        if(e && e.code === "images_unavailable" && avecImages){
+          imagesKO = true; majMode();
+          if(colle || annexes){
+            $("#iState").innerHTML = '<span class="thinking"><i></i>Photos refusées — reprise sur le texte seul…</span>';
+            res = await appeler(false);
+          }else{
+            throw e;
+          }
+        }else throw e;
+      }
+      docs = (res && res.documents) || [];
     }
-    const docs = (res && res.documents) || [];
+
+    ch.fini();
     if(!docs.length){ $("#iState").textContent = "Rien n'a pu être lu."; btn.disabled=false; return; }
     $("#iState").textContent = docs.length + " document(s) reconnu(s)" + (!avecImages && imgs.length ? " — photos ignorées" : "");
     afficherResultats(docs, mid);
   }catch(e){
+    ch.fini();
     $("#iState").textContent = msgErreur(e);
     $("#iOut").innerHTML = (e && (e.code === "images_unavailable" || e.code === "not_granted"))
       ? '<div class="card" style="border-color:var(--warn)"><h4 style="color:var(--warn)">Activer la lecture des photos</h4>'
