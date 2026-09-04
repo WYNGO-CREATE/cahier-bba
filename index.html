@@ -321,6 +321,19 @@
   .creation b{display:block;font-size:15.5px;font-weight:650}
   .creation em{display:block;font-style:normal;font-size:13px;color:var(--texte-2);margin-top:2px}
 
+  /* marques relevées sur les pages manuscrites */
+  .vu-marque{display:inline-block;font-size:.72em;font-family:var(--ui);font-weight:650;
+    letter-spacing:.02em;text-transform:lowercase;padding:1px 7px;border-radius:99px;
+    background:var(--accent-doux);color:var(--accent);vertical-align:.12em;margin:0 2px}
+  .vu-doute{color:var(--attention);border-bottom:1.5px dotted var(--attention);cursor:help}
+  .vu-schema{display:block;margin:.6em 0;padding:9px 12px;border-left:3px solid var(--accent);
+    background:var(--surface-2);border-radius:0 8px 8px 0;font-family:var(--ui);
+    font-size:.85em;color:var(--texte-2)}
+  .vu-schema b{color:var(--accent);text-transform:uppercase;font-size:.85em;letter-spacing:.05em;
+    display:block;margin-bottom:2px}
+  .vu-lien{display:inline-block;font-family:var(--ui);font-size:.8em;color:var(--texte-2);
+    background:var(--surface-2);padding:1px 8px;border-radius:6px}
+
   /* plan de rangement */
   .prop{display:flex;gap:11px;align-items:flex-start;padding:12px 13px;margin-bottom:8px;
     background:var(--surface-2);border:1px solid var(--trait);border-radius:var(--r);cursor:pointer}
@@ -583,6 +596,15 @@ function md(src){
   const inline = t => esc(t)
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
       (m,txt,url)=>'<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+txt+"</a>")
+    // Marques relevées sur une page manuscrite : elles doivent se distinguer
+    // du texte du cours, sinon l'information qu'elles portent se perd.
+    .replace(/\[(sch[ée]ma|figure|graphique)\s*:\s*([^\]]+)\]/gi,
+      (m,quoi,desc)=>'<span class="vu-schema"><b>'+quoi+'</b> '+desc+"</span>")
+    .replace(/\[(fl[èe]che\s*:\s*[^\]]+)\]/gi, (m,x)=>'<span class="vu-lien">'+x+"</span>")
+    .replace(/\[(encadr[ée]|entour[ée]|soulign[ée]|signal[ée]|surlign[ée][^\]]*|[ée]crit en [^\]]+|marge)\]/gi,
+      (m,x)=>'<span class="vu-marque">'+x+"</span>")
+    .replace(/\[illisible\]/gi, '<span class="vu-doute">illisible</span>')
+    .replace(/(\S+)\[\?\]/g, (m,mot)=>'<span class="vu-doute" title="lecture incertaine">'+mot+"</span>")
     .replace(/\$\$([^$]+)\$\$/g, (m,x)=>"<code>"+x.trim()+"</code>")
     .replace(/\$([^$\n]+)\$/g, (m,x)=>"<code>"+x.trim()+"</code>")
     .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -672,6 +694,16 @@ const S_CLE = { anthropic: LS_KEY + "-key", gemini: LS_KEY + "-key-gemini" };
 
 function cleActive(){ return IA.cles[IA.fournisseur] || ""; }
 
+/* Qualité d'envoi des photos : « fine » préserve les traits ténus au prix
+   de quelques jetons de plus. Utile sur du crayon pâle ou une écriture serrée. */
+const S_QUALITE = LS_KEY + "-qualite-photo";
+function qualiteFine(){
+  try{ return localStorage.getItem(S_QUALITE) === "fine"; }catch(e){ return false; }
+}
+function reglerQualite(v){
+  try{ localStorage.setItem(S_QUALITE, v); }catch(e){}
+}
+
 function chargerConfig(){
   try{
     IA.fournisseur = localStorage.getItem(S_FOURN) || "gemini";
@@ -723,26 +755,81 @@ function majMode(){
   }
 }
 
-/* ---------- préparation des images : redimensionnement avant envoi ---------- */
-const MAX_COTE = 2000;   // borne haute de la vision Claude, sans gaspiller d'octets
+/* ---------- préparation des images ----------
+   Sur une page manuscrite, ce sont les traits fins — une accolade, un
+   soulignement, la limite d'un surlignage pâle — qui disparaissent en
+   premier. On préserve donc la définition et on compresse peu : le coût
+   d'un jeton de plus est sans commune mesure avec celui d'une notion
+   perdue. Le lissage du navigateur est désactivé pour ne pas noyer les
+   traits d'un stylo fin. */
+const MAX_COTE_STD  = 2400;   // suffisant pour une page A4 dense
+const MAX_COTE_FIN  = 3000;   // écriture serrée, crayon pâle, annotations fines
+const QUALITE_STD   = 0.92;
+const QUALITE_FINE  = 0.96;
 
-function imageEnBase64(file){
+function imageEnBase64(file, opts){
+  opts = opts || {};
+  const cote = opts.fin ? MAX_COTE_FIN : MAX_COTE_STD;
+  const qualite = opts.fin ? QUALITE_FINE : QUALITE_STD;
   return new Promise((resolve, reject)=>{
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = ()=>{
-      const ratio = Math.min(1, MAX_COTE / Math.max(img.width, img.height));
+      // On n'agrandit jamais : une photo déjà petite ne gagne rien à être étirée.
+      const ratio = Math.min(1, cote / Math.max(img.width, img.height));
       const c = document.createElement("canvas");
-      c.width = Math.round(img.width * ratio);
-      c.height = Math.round(img.height * ratio);
-      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      c.width  = Math.max(1, Math.round(img.width  * ratio));
+      c.height = Math.max(1, Math.round(img.height * ratio));
+      const g = c.getContext("2d");
+      g.imageSmoothingEnabled = ratio < 1;
+      if(ratio < 1) g.imageSmoothingQuality = "high";
+      g.drawImage(img, 0, 0, c.width, c.height);
       URL.revokeObjectURL(url);
-      const data = c.toDataURL("image/jpeg", 0.9);
+      const data = c.toDataURL("image/jpeg", qualite);
       resolve({ media: "image/jpeg", b64: data.slice(data.indexOf(",")+1) });
     };
     img.onerror = ()=>{ URL.revokeObjectURL(url); reject(new Error("image illisible")); };
     img.src = url;
   });
+}
+
+/* =========================================================
+   LECTURE D'UNE PAGE MANUSCRITE
+   Une page de cours n'est pas du texte : c'est du texte annoté. Ce qui
+   est encadré, souligné trois fois ou écrit en rouge porte l'information
+   la plus dense de la page — c'est ce que le professeur a jugé décisif.
+   Transcrire en oubliant ces marques revient à jeter le tri déjà fait.
+   Ces consignes demandent donc de restituer le sens de chaque marque,
+   pas seulement les mots.
+   ========================================================= */
+function consigneVision(contexte){
+  return "Tu lis une page de cours d'un étudiant : notes manuscrites, polycopié annoté, "
+    + "photo d'un tableau ou d'une diapositive.\n"
+    + (contexte ? contexte + "\n" : "")
+    + "\nRESTITUE LE TEXTE\n"
+    + "Transcris intégralement, sans rien résumer ni réorganiser. Respecte l'ordre de lecture réel : "
+    + "colonnes lues l'une après l'autre, encadré traité à l'endroit où il s'insère, note de bas de page à sa place. "
+    + "Conserve la numérotation du cours (I, A, 1., a)). Formules en LaTeX entre $…$, tableaux en markdown.\n"
+    + "\nRESTITUE LES ANNOTATIONS — c'est le plus important\n"
+    + "Une marque manuscrite est un jugement du professeur ou de l'étudiant sur l'importance. Rends-la :\n"
+    + "- surligné → ==texte surligné== ; précise la couleur si plusieurs sont utilisées : ==texte== [surligné en jaune]\n"
+    + "- encadré, entouré, souligné plusieurs fois, précédé d'une étoile ou d'une flèche → **texte** suivi de "
+    + "[encadré], [entouré], [souligné], [signalé] selon le cas\n"
+    + "- écrit dans une couleur différente du corps du texte → **texte** [écrit en rouge]\n"
+    + "- ajout dans la marge, entre les lignes, ou d'une autre main → sur sa propre ligne, en citation : "
+    + "> [marge] contenu de l'annotation\n"
+    + "- flèche reliant deux éléments → une phrase explicite : [flèche : « intérêts » renvoie à « charges financières »]\n"
+    + "- « à savoir », « tombe à l'examen », « attention », « ex. » → conserve ces mentions telles quelles, elles sont capitales\n"
+    + "\nSCHÉMAS ET DESSINS\n"
+    + "Décris chaque schéma entre crochets, en une à trois phrases, en nommant les éléments et leurs relations : "
+    + "[schéma : un axe horizontal du temps, cinq annuités décroissantes, la valeur résiduelle en pointillés à droite]. "
+    + "Transcris tout texte figurant dans le schéma.\n"
+    + "\nHONNÊTETÉ\n"
+    + "N'invente jamais un mot pour combler un trou. Un mot douteux s'écrit mot[?], un passage illisible [illisible]. "
+    + "Un mot rendu incertain par l'écriture vaut mieux qu'un mot inventé qui sera révisé comme vrai.\n"
+    + "\nRENDU\n"
+    + "Réponds uniquement par le contenu de la page en markdown, prêt à s'insérer dans un cours. "
+    + "Aucune introduction, aucun commentaire, aucune conclusion de ta part.";
 }
 
 /* ---------- découverte des modèles : ne jamais dépendre d'un nom figé ---------- */
@@ -904,6 +991,93 @@ async function diagnostic(progres){
     IA.modele = avant;
   }
   return L.join("\n");
+}
+
+/* Page d'épreuve : une note annotée fabriquée de toutes pièces, dont on
+   connaît le contenu exact. Elle sert à mesurer ce que le modèle rend
+   vraiment des surlignages, des entourages et de la couleur — plutôt que
+   de l'espérer. */
+function pageEpreuve(){
+  const c = document.createElement("canvas");
+  c.width = 1000; c.height = 700;
+  const g = c.getContext("2d");
+  g.fillStyle = "#fffdf5"; g.fillRect(0,0,c.width,c.height);
+
+  // lignes de cahier
+  g.strokeStyle = "#dfe6ef"; g.lineWidth = 1;
+  for(let y=90; y<c.height; y+=42){ g.beginPath(); g.moveTo(60,y); g.lineTo(960,y); g.stroke(); }
+  g.strokeStyle = "#f0c3c3"; g.beginPath(); g.moveTo(120,20); g.lineTo(120,680); g.stroke();
+
+  const plume = "600 30px 'Bradley Hand','Segoe Script','Comic Sans MS',cursive";
+  g.font = plume; g.fillStyle = "#1b2a4a";
+
+  g.fillText("Chapitre 2 - Les amortissements", 140, 80);
+
+  // surlignage jaune derrière une notion
+  g.fillStyle = "rgba(255,232,64,.75)";
+  g.fillRect(138, 108, 372, 34);
+  g.fillStyle = "#1b2a4a"; g.font = plume;
+  g.fillText("La base amortissable", 140, 134);
+  g.fillText("est la valeur d'origine moins", 520, 134);
+  g.fillText("la valeur residuelle estimee.", 140, 176);
+
+  // mot entoure en rouge
+  g.fillStyle = "#c0392b";
+  g.fillText("annuite", 140, 260);
+  g.strokeStyle = "#c0392b"; g.lineWidth = 3.5;
+  g.beginPath(); g.ellipse(212, 250, 92, 30, 0, 0, Math.PI*2); g.stroke();
+
+  g.fillStyle = "#1b2a4a";
+  g.fillText("= base / duree d'usage", 330, 260);
+
+  // note de marge, autre couleur
+  g.fillStyle = "#1d7a4c"; g.font = "600 23px 'Bradley Hand','Segoe Script',cursive";
+  g.fillText("tombe a l'examen !", 620, 320);
+  g.strokeStyle = "#1d7a4c"; g.lineWidth = 2.5;
+  g.beginPath(); g.moveTo(610, 310); g.lineTo(500, 268); g.stroke();
+
+  // souligne trois fois
+  g.fillStyle = "#1b2a4a"; g.font = plume;
+  g.fillText("methode lineaire", 140, 400);
+  g.strokeStyle = "#1b2a4a"; g.lineWidth = 2;
+  [410, 417, 424].forEach(y=>{ g.beginPath(); g.moveTo(140,y); g.lineTo(400,y); g.stroke(); });
+
+  // petit schema
+  g.strokeStyle = "#1b2a4a"; g.lineWidth = 2.5;
+  g.beginPath(); g.moveTo(160, 620); g.lineTo(820, 620); g.stroke();
+  g.beginPath(); g.moveTo(820, 620); g.lineTo(806, 612); g.lineTo(806, 628); g.fill();
+  for(let k=0;k<5;k++){
+    const x = 200 + k*120, h = 130 - k*20;
+    g.strokeRect(x, 620-h, 70, h);
+  }
+  g.font = "500 20px 'Bradley Hand',cursive";
+  g.fillText("t", 830, 626);
+  g.fillText("annuites decroissantes", 300, 665);
+
+  return c;
+}
+
+async function epreuveVision(progres){
+  const c = pageEpreuve();
+  const blob = await new Promise(r=>c.toBlob(r, "image/jpeg", 0.96));
+  const texte = await iaTexte({
+    system: NIVEAU,
+    messages: [{ role:"user", content: consigneVision("Page de test.") }],
+    images: [blob], fin: true, effort: "medium", maxTokens: 4000,
+    onText: progres
+  });
+
+  const t = texte.toLowerCase();
+  const criteres = [
+    { nom:"texte manuscrit lu",        ok: /base amortissable/.test(t) && /valeur r[ée]siduelle/.test(t) },
+    { nom:"surlignage signalé",        ok: /==/.test(texte) || /surlign/.test(t) },
+    { nom:"mot entouré repéré",        ok: /entour|encadr|cercl/.test(t) },
+    { nom:"couleur restituée",         ok: /rouge|vert/.test(t) },
+    { nom:"note de marge captée",      ok: /examen/.test(t) },
+    { nom:"soulignement relevé",       ok: /soulign/.test(t) },
+    { nom:"schéma décrit",             ok: /sch[ée]ma|figure|barres|annuit[ée]s/.test(t) }
+  ];
+  return { texte, criteres, reussis: criteres.filter(x=>x.ok).length };
 }
 
 /* Vérifie par l'usage qu'un modèle répond vraiment — le catalogue ne suffit pas. */
@@ -1242,7 +1416,7 @@ async function iaTexte(opts){
   const messages = normaliser(opts.messages);
   if(IA.mode === "api"){
     const imgs = [];
-    for(const f of (images||[])) imgs.push(await imageEnBase64(f));
+    for(const f of (images||[])) imgs.push(await imageEnBase64(f, { fin: opts.fin || qualiteFine() }));
     return avecReprises(()=>appelAPI({ system, messages, images:imgs, effort, maxTokens, onText, recherche, sources, signal }));
   }
   if(IA.mode === "artifact"){
@@ -1261,7 +1435,7 @@ async function iaJson(opts){
   opts = { ...opts, messages: normaliser(opts.messages) };
   if(IA.mode === "api"){
     const imgs = [];
-    for(const f of (opts.images||[])) imgs.push(await imageEnBase64(f));
+    for(const f of (opts.images||[])) imgs.push(await imageEnBase64(f, { fin: opts.fin || qualiteFine() }));
     const t = await avecReprises(()=>appelAPI({ ...opts, images:imgs }));
     try{ return JSON.parse(t); }
     catch(e){
@@ -1644,16 +1818,16 @@ function openEditor(opts){
     for(let i = 0; i < photos.length; i++){
       const ch = chantier(etat, "Photo " + (i+1) + "/" + photos.length, { delai: 120000 });
       try{
+        // La fin de ce qui précède est transmise : elle permet de reconnaître
+        // une phrase coupée en bas de page et de reprendre le fil sans doublon.
+        const amont = ta.value.slice(Math.max(0, pos - 700), pos).trim();
         const texte = await iaTexte({
           system: NIVEAU,
-          messages: [{ role:"user", content:
-            "Cette image est une page de notes de cours, un polycopié, un tableau ou une slide.\n"
-            + "Retranscris-la intégralement en markdown : tout le texte, les titres, la numérotation, "
-            + "les définitions, les formules (en LaTeX entre $…$), les tableaux (en markdown). "
-            + "Décris un schéma en une phrase entre crochets. Marque `[illisible]` là où tu n'es pas sûr.\n"
-            + "Ne résume pas, n'ajoute aucun commentaire, ne mets ni introduction ni conclusion : "
-            + "renvoie uniquement le contenu de la page, prêt à s'insérer au milieu d'un cours." }],
-          images: [photos[i]], effort: "medium", maxTokens: 8000, signal: ch.signal
+          messages: [{ role:"user", content: consigneVision(
+            (photos.length > 1 ? "Page " + (i+1) + " sur " + photos.length + " d'une même prise de notes." : "")
+            + (amont ? "\n\nFin du texte déjà saisi, juste avant cette page — enchaîne sans le répéter :\n« …"
+                + amont.slice(-400) + " »" : "")) }],
+          images: [photos[i]], fin: true, effort: "medium", maxTokens: 8000, signal: ch.signal
         });
         ch.fini();
 
@@ -1803,11 +1977,8 @@ async function ocrPagePDF(page, signal){
   const blob = await new Promise(r=>c.toBlob(r, "image/jpeg", 0.85));
   return iaTexte({
     system: NIVEAU,
-    messages: [{ role:"user", content:
-      "Cette image est une page de document de cours scannée. Retranscris-la intégralement en markdown : "
-      + "texte, titres, numérotation, formules (LaTeX entre $…$), tableaux. Marque `[illisible]` si besoin. "
-      + "Aucun commentaire, aucune introduction : uniquement le contenu de la page." }],
-    images: [blob], effort: "low", maxTokens: 8000, signal
+    messages: [{ role:"user", content: consigneVision("Page scannée d'un document de cours.") }],
+    images: [blob], effort: "medium", maxTokens: 8000, signal
   });
 }
 
@@ -1989,7 +2160,10 @@ async function lancerImport(files, mid, hint, maxN, colle){
     + (colle ? "\nTEXTE FOURNI PAR L'ÉTUDIANT :\n" + colle.slice(0,34000) + "\n" : "")
     + (annexes ? "\nCONTENU DES FICHIERS JOINTS :" + annexes + "\n" : "")
     + "\nTravail à faire :\n"
-    + "1. RETRANSCRIS intégralement chaque document : tout le texte, titres, numérotation, définitions, formules (en LaTeX entre $…$), tableaux (markdown), schémas (décris-les en une phrase entre crochets). Ne résume pas, ne saute rien, n'invente rien. Marque `[illisible]` là où tu n'es pas sûr.\n"
+    + "1. RETRANSCRIS intégralement chaque document, en suivant ces règles de lecture :\n"
+    + (avecImages ? consigneVision("").split("RESTITUE LE TEXTE")[1].split("RENDU")[0].trim() + "\n"
+                  : "Tout le texte, titres, numérotation, définitions, formules (LaTeX entre $…$), tableaux (markdown). "
+                    + "Ne résume pas, ne saute rien, n'invente rien. Marque `[illisible]` là où tu n'es pas sûr.\n")
     + "2. REGROUPE les pages qui se suivent et appartiennent au même document en une seule entrée ; SÉPARE en entrées distinctes ce qui est de nature différente (cours / exercices / corrigé) ou d'un chapitre différent.\n"
     + "3. CLASSE chaque entrée : réutilise l'id d'un chapitre existant si le contenu y correspond, sinon propose un nouveau chapitre.\n\n"
     + 'Réponds UNIQUEMENT avec ce JSON :\n'
@@ -2640,8 +2814,17 @@ function openSettings(){
           + '<div style="display:flex;gap:8px"><input class="field" id="sModele" value="'+esc(IA.modele)+'" spellcheck="false">'
           + '<button class="btn sm" id="sModList" style="white-space:nowrap">Lister</button></div>'
           + '<p class="note" id="sModOut" style="margin-top:6px">« Lister » interroge le fournisseur pour afficher les modèles réellement disponibles avec ta clé.</p></div>'
+          + '<div style="margin-top:14px"><label class="lab">Qualité de lecture des photos</label>'
+          + '<div class="seg" id="sQual">'
+          +   '<button type="button" data-q="std" aria-pressed="'+(!qualiteFine())+'">Standard</button>'
+          +   '<button type="button" data-q="fine" aria-pressed="'+qualiteFine()+'">Maximale</button>'
+          + "</div>"
+          + '<p class="note" style="margin-top:6px">Maximale envoie une image plus définie et moins compressée : '
+          + "les traits fins, le crayon pâle et les surlignages tenus passent mieux. Coûte un peu plus de jetons. "
+          + "L'insertion d'une photo pendant la frappe est toujours en définition maximale.</p></div>"
           + '<div class="doc-actions" style="margin-top:12px"><button class="btn sm pri" id="sKeySave">Enregistrer</button>'
-          + '<button class="btn sm" id="sKeyTest">Diagnostic complet</button></div>'
+          + '<button class="btn sm" id="sKeyTest">Diagnostic complet</button>'
+          + '<button class="btn sm" id="sEpreuve">Épreuve de lecture manuscrite</button></div>'
           + '<p class="note" id="sKeyOut" style="margin-top:8px"></p>'
           + '<pre id="sDiag" class="hide" style="margin-top:10px;background:var(--surface-2);border:1px solid var(--line);'
           + 'border-radius:8px;padding:10px 12px;font-size:11.5px;line-height:1.5;overflow-x:auto;white-space:pre-wrap"></pre>'
@@ -2709,6 +2892,40 @@ function openSettings(){
           + "</span>";
         out.querySelectorAll("[data-mod]").forEach(b=>b.onclick=()=>{ $("#sModele").value = b.dataset.mod; });
       }catch(e){ out.innerHTML = '<b style="color:var(--alert)">'+esc(msgErreur(e))+"</b>"; }
+      btn.disabled = false;
+    };
+
+    document.querySelectorAll("#sQual [data-q]").forEach(b=>b.onclick=()=>{
+      reglerQualite(b.dataset.q);
+      closeModal(); openSettings();
+    });
+
+    $("#sEpreuve").onclick = async ()=>{
+      const out = $("#sKeyOut"), btn = $("#sEpreuve"), pre = $("#sDiag"), act = $("#sDiagActions");
+      if(IA.mode === "off" || !IA.vision){ out.textContent = "La lecture des photos n'est pas active."; return; }
+      btn.disabled = true;
+      pre.classList.remove("hide");
+      pre.textContent = "";
+      out.innerHTML = '<span class="thinking"><i></i>Lecture d\'une page annotée fabriquée pour l\'occasion…</span>';
+      try{
+        const r = await epreuveVision(t=>{ pre.textContent = t; });
+        const bilan = "=== Épreuve de lecture manuscrite ===\n"
+          + "Modèle : " + IA.modele + "\n"
+          + "Définition : " + (qualiteFine() ? "maximale" : "standard") + "\n\n"
+          + r.criteres.map(c=>(c.ok ? "  [OK] " : "  [X]  ") + c.nom).join("\n")
+          + "\n\nScore : " + r.reussis + "/" + r.criteres.length
+          + "\n\n--- ce que le modèle a rendu ---\n" + r.texte;
+        pre.textContent = bilan;
+        out.innerHTML = r.reussis >= 6
+          ? '<b style="color:var(--ok)">' + r.reussis + "/7 — ton modèle lit correctement les annotations.</b>"
+          : r.reussis >= 4
+            ? '<b style="color:var(--attention)">' + r.reussis + "/7 — lecture partielle. Essaie la définition maximale, ou un autre modèle.</b>"
+            : '<b style="color:var(--alerte)">' + r.reussis + "/7 — ce modèle lit mal les annotations. Change-en dans la liste.</b>";
+        act.classList.remove("hide");
+        $("#sDiagCopy").onclick = ()=>{ try{ navigator.clipboard.writeText(bilan); $("#sDiagCopied").textContent="copié"; }catch(e){} };
+      }catch(e){
+        out.innerHTML = '<b style="color:var(--alerte)">' + esc(msgErreur(e)) + "</b>";
+      }
       btn.disabled = false;
     };
 
