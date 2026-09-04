@@ -3471,6 +3471,15 @@ function vueReglages(){
     +   '<p class="note" style="margin-top:6px">Lecture des photos : <b style="color:'+(IA.vision?"var(--ok)":"var(--attention)")+'">'
     +     (IA.vision?"active":"inactive")+"</b></p>"
     +   '<div class="doc-actions"><button class="btn pri sm" id="rIA">Configurer</button></div></div>'
+    + '<div class="card"><h4>Lecture des photos</h4>'
+    +   '<p class="note">Vérifie sur une page manuscrite fabriquée pour l\'occasion — surlignage, mot entouré, '
+    +   "note de marge, schéma — ce que ton modèle restitue vraiment. Score sur 7.</p>"
+    +   '<div class="seg" style="margin-top:10px" id="rQual">'
+    +     '<button data-q="std" aria-pressed="'+(!qualiteFine())+'">Définition standard</button>'
+    +     '<button data-q="fine" aria-pressed="'+qualiteFine()+'">Maximale</button>'
+    +   "</div>"
+    +   '<div class="doc-actions"><button class="btn pri sm" id="rEpreuve">Lancer l\'épreuve</button></div>'
+    +   '<div id="rEpOut"></div></div>'
     + '<div class="card"><h4>Matières</h4><p class="note">'+state.matieres.length+" matière"+(state.matieres.length>1?"s":"")+" · modifie la liste, les codes et les profs.</p>"
     +   '<div class="doc-actions"><button class="btn sm" id="rMat">Gérer mes matières</button></div></div>'
     + '<div class="card"><h4>Apparence</h4><p class="note">Le cahier suit ton système. Tu peux forcer un mode.</p>'
@@ -3486,6 +3495,38 @@ function vueReglages(){
     + "</div>";
 
   $("#rIA").onclick = openSettings;
+  $("#rQual").querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{ reglerQualite(b.dataset.q); vueReglages(); });
+  $("#rEpreuve").onclick = async ()=>{
+    const btn = $("#rEpreuve"), out = $("#rEpOut");
+    if(IA.mode === "off" || !IA.vision){
+      out.innerHTML = '<p class="note" style="margin-top:10px;color:var(--attention)">'
+        + "La lecture des photos n'est pas active. Configure le moteur IA au-dessus.</p>";
+      return;
+    }
+    btn.disabled = true;
+    out.innerHTML = '<div id="rEpEtat" style="margin-top:10px"></div>'
+      + '<pre id="rEpTexte" style="margin-top:10px;background:var(--surface-3);border-radius:10px;'
+      + 'padding:10px 12px;font-size:11.5px;line-height:1.5;white-space:pre-wrap;max-height:220px;overflow:auto"></pre>';
+    const ch = chantier($("#rEpEtat"), "Lecture de la page d'épreuve", { delai: 150000 });
+    try{
+      const r = await epreuveVision(t=>{ const e = $("#rEpTexte"); if(e) e.textContent = t; });
+      ch.fini();
+      const couleur = r.reussis >= 6 ? "var(--ok)" : r.reussis >= 4 ? "var(--attention)" : "var(--alerte)";
+      const verdict = r.reussis >= 6 ? "ton modèle lit correctement les annotations."
+        : r.reussis >= 4 ? "lecture partielle — essaie la définition maximale, ou un autre modèle."
+        : "ce modèle lit mal les annotations — changes-en dans Configurer.";
+      $("#rEpEtat").innerHTML = '<b style="color:'+couleur+'">' + r.reussis + "/7 — " + verdict + "</b>"
+        + '<div style="margin-top:10px">'
+        + r.criteres.map(c=>'<div class="note" style="padding:3px 0">'
+            + '<span style="color:'+(c.ok?"var(--ok)":"var(--alerte)")+';font-weight:700">'
+            + (c.ok?"✓":"✗") + "</span> " + esc(c.nom) + "</div>").join("")
+        + "</div>";
+    }catch(e){
+      ch.fini();
+      $("#rEpEtat").innerHTML = '<b style="color:var(--alerte)">' + esc(msgErreur(e)) + "</b>";
+    }
+    btn.disabled = false;
+  };
   $("#rMat").onclick = openMatieresModal;
   $("#rExp").onclick = exporterJSON;
   $("#rImp").onclick = importerJSON;
