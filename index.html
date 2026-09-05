@@ -2079,7 +2079,7 @@ function openImport(){
   const accept = (imgLim && imgLim.mediaTypes ? imgLim.mediaTypes.join(",") : "image/*") + ",.pdf,.txt,.md,.csv,.tsv,.json";
   const maxN = IA.mode === "api" ? 12 : (imgLim ? imgLim.maxCount : MAX_IMG_DEFAUT);
 
-  modal('<div class="modal-head"><h2>Importer des documents</h2><button class="btn ghost sm" data-x>✕</button></div>'
+  modal('<div class="modal-head"><h2>Importer photos et PDF</h2><button class="btn ghost sm" data-x>✕</button></div>'
     + '<div class="modal-body"><div class="stack">'
     + '<div><label class="lab" for="iM">Matière</label><select class="field" id="iM">'
     +   state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===state.selMat?" selected":"")+">"+esc(m.nom)+"</option>").join("")+"</select></div>"
@@ -3152,7 +3152,7 @@ function openCreation(){
 
   modal('<div class="modal-head"><h2>Ajouter au cahier</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
     + '<div class="modal-body"><div class="creation-liste">'
-    + ligne("photo","▣","Importer des photos","Tes notes sont lues, triées et rangées")
+    + ligne("photo","▣","Importer photos et PDF","Polys, scans, photos de notes — lus, triés et rangés")
     + ligne("texte","✎","Écrire un cours","Saisir ou coller, avec mise au propre")
     + ligne("programme","☰","Coller le programme", m ? "Le semestre de « "+m.nom+" » en chapitres" : "Le semestre en chapitres")
     + ligne("chapitre","§","Nouveau chapitre", m ? "Dans « "+m.nom+" »" : "Dans une matière")
@@ -3341,7 +3341,7 @@ function vueMatiere(){
           + "</div>"
         : "")
     + '<div class="doc-actions" style="margin:6px 0 4px">'
-    +   '<button class="btn pri sm" data-import="1">＋ Importer</button>'
+    +   '<button class="btn pri sm" data-import="1">＋ Photos / PDF</button>'
     +   '<button class="btn sm" data-ecrire="">✎ Écrire</button>'
     +   '<button class="btn sm" data-programme="1">☰ Programme</button>'
     +   '<button class="btn sm" data-ranger="1">⇄ Ranger</button>'
@@ -3405,7 +3405,7 @@ function vueChapitre(){
         ? '<button class="btn pri sm" data-analyse="'+c.id+'">'+(a?"Relancer l'analyse":"Analyser ce chapitre")+"</button>"
         : '<button class="btn pri sm" data-preparer="'+c.id+'">Préparer ce chapitre</button>')
     +   '<button class="btn sm" data-question="'+c.id+'">Poser une question</button>'
-    +   '<button class="btn sm" data-import="1">＋ Importer</button>'
+    +   '<button class="btn sm" data-import="1">＋ Photos / PDF</button>'
     +   '<button class="btn sm" data-ecrire="'+c.id+'">✎ Écrire</button>'
     +   '<button class="btn sm fantome" data-editchap="'+c.id+'">Modifier</button>'
     +   '<button class="btn sm fantome danger" data-delchap="'+c.id+'">Supprimer</button>'
