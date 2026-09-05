@@ -1939,8 +1939,56 @@ function chargerPDFJS(){
    considérée comme scannée : c'est le seuil qui sépare un poly numérique
    d'une photocopie. */
 const SEUIL_PAGE_VIDE = 40;
+/* Chaque page lue en image est un appel au modèle : on borne pour qu'un poly
+   de deux cents pages ne se transforme pas en facture surprise. */
+const PLAFOND_PAGES_IMAGE = 40;
 
-async function lirePDF(file, { signal, onEtat } = {}){
+/* Une page peut porter du texte ET des annotations manuscrites : un poly
+   imprimé qu'on a surligné et entouré. L'extraction de texte seule les
+   perd toutes. On repère donc ces pages par deux voies complémentaires. */
+const SOUS_TYPES_ANNOTATION = ["Ink","Highlight","Square","Circle","FreeText",
+  "Underline","StrikeOut","Squiggly","Polygon","PolyLine","Stamp","Text","Caret"];
+
+/* Voie 1 — annotations déclarées : un PDF annoté dans un lecteur ou sur
+   tablette porte des objets d'annotation que pdf.js sait énumérer. */
+async function annotationsDeclarees(page){
+  try{
+    const a = await page.getAnnotations({ intent:"display" });
+    return (a||[]).filter(x=>SOUS_TYPES_ANNOTATION.indexOf(x.subtype) >= 0).length;
+  }catch(e){ return 0; }
+}
+
+/* Voie 2 — encre aplatie : une fois le trait fondu dans l'image de la page,
+   aucun objet ne subsiste. Mais un poly imprimé est quasi gris, alors qu'un
+   stylo ou un surligneur est très saturé. On compte donc les pixels colorés
+   sur un rendu minuscule : quelques millisecondes, aucun appel réseau. */
+const SEUIL_COULEUR = 0.004;   // 0,4 % de pixels colorés suffit à trahir un trait
+
+async function tauxCouleur(page){
+  try{
+    const vp0 = page.getViewport({ scale: 1 });
+    const echelle = 180 / Math.max(vp0.width, vp0.height);
+    const vp = page.getViewport({ scale: echelle });
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(vp.width));
+    c.height = Math.max(1, Math.round(vp.height));
+    const g = c.getContext("2d", { willReadFrequently:true });
+    g.fillStyle = "#fff"; g.fillRect(0,0,c.width,c.height);
+    await page.render({ canvasContext:g, viewport:vp }).promise;
+    const d = g.getImageData(0,0,c.width,c.height).data;
+    let colores = 0, total = 0;
+    for(let i = 0; i < d.length; i += 4){
+      const r = d[i], v = d[i+1], b = d[i+2];
+      const max = Math.max(r,v,b), min = Math.min(r,v,b);
+      if(max > 245 && min > 245) continue;          // fond blanc : ignoré
+      total++;
+      if(max - min > 42) colores++;                  // écart de teinte : de la couleur
+    }
+    return total ? colores / total : 0;
+  }catch(e){ return 0; }
+}
+
+async function lirePDF(file, { signal, onEtat, toutAnnote } = {}){
   const lib = await chargerPDFJS();
   const doc = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
   const pages = [];
@@ -1950,16 +1998,27 @@ async function lirePDF(file, { signal, onEtat } = {}){
     const page = await doc.getPage(i);
     const contenu = await page.getTextContent();
     const texte = contenu.items.map(x=>x.str).join(" ").replace(/[ \t]+/g, " ").trim();
-    pages.push(texte.length >= SEUIL_PAGE_VIDE
-      ? { num:i, texte, scan:false }
-      : { num:i, texte:"", scan:true, page });
+
+    if(texte.length < SEUIL_PAGE_VIDE){
+      // Aucune couche de texte : page scannée, lecture d'image obligatoire.
+      pages.push({ num:i, texte:"", scan:true, annotee:true, page });
+      continue;
+    }
+
+    const nbAnnot = await annotationsDeclarees(page);
+    const couleur = nbAnnot ? 1 : await tauxCouleur(page);
+    const annotee = !!toutAnnote || nbAnnot > 0 || couleur > SEUIL_COULEUR;
+    pages.push({ num:i, texte, scan:false, annotee, page,
+                 motif: nbAnnot ? nbAnnot + " annotation" + (nbAnnot>1?"s":"") + " déclarée" + (nbAnnot>1?"s":"")
+                       : (annotee ? Math.round(couleur*1000)/10 + " % de couleur" : "") });
   }
   return { nom: file.name, pages, total: doc.numPages,
-           scannees: pages.filter(p=>p.scan).length };
+           scannees: pages.filter(p=>p.scan).length,
+           annotees: pages.filter(p=>p.annotee && !p.scan).length };
 }
 
 /* Rendu d'une page scannée en image, puis lecture par l'IA. */
-async function ocrPagePDF(page, signal){
+async function ocrPagePDF(page, signal, contexte){
   const vp = page.getViewport({ scale: 2 });
   const c = document.createElement("canvas");
   c.width = Math.min(vp.width, 2000);
@@ -1969,9 +2028,25 @@ async function ocrPagePDF(page, signal){
   const blob = await new Promise(r=>c.toBlob(r, "image/jpeg", 0.85));
   return iaTexte({
     system: NIVEAU,
-    messages: [{ role:"user", content: consigneVision("Page scannée d'un document de cours.") }],
+    messages: [{ role:"user", content: consigneVision(contexte || "Page scannée d'un document de cours.") }],
     images: [blob], effort: "medium", maxTokens: 8000, signal
   });
+}
+
+/* Page imprimée annotée à la main : le texte imprimé est déjà connu avec
+   certitude par extraction. Inutile de le faire redéchiffrer au modèle —
+   on le lui donne comme référence et on lui demande de n'y ajouter que ce
+   que l'extraction ne peut pas voir : le trait, le surlignage, la marge. */
+async function lirePageAnnotee(page, texteImprime, signal){
+  return ocrPagePDF(page, signal,
+    "Cette page est un document imprimé sur lequel un étudiant a écrit à la main.\n"
+    + "Le texte imprimé a déjà été extrait avec certitude, le voici — reprends-le tel quel, "
+    + "sans le retaper de mémoire ni le corriger :\n\n« " + String(texteImprime).slice(0, 6000) + " »\n\n"
+    + "Ton travail porte uniquement sur ce que cette extraction ne peut pas voir : les traces manuscrites. "
+    + "Rends le texte imprimé en markdown propre, et insère les annotations À LEUR PLACE EXACTE dans ce texte — "
+    + "un mot surligné devient ==ce mot==, un passage entouré devient **ce passage** [entouré], "
+    + "une note de marge apparaît en citation à la hauteur du paragraphe qu'elle commente. "
+    + "Si une page ne porte aucune trace manuscrite, rends simplement le texte imprimé.");
 }
 
 /* Découpe un long texte en tranches, sans couper au milieu d'un paragraphe. */
@@ -2013,6 +2088,10 @@ function openImport(){
     + '<div class="thumbs" id="thumbs"></div>'
     + '<div><label class="lab" for="iPaste">Ou colle du texte — poly, PDF copié-collé, transcription</label>'
     +   '<textarea class="field" id="iPaste" rows="7" placeholder="Colle ici le contenu brut. Plusieurs chapitres ou plusieurs documents à la suite : ils seront séparés et classés."></textarea></div>'
+    + '<label class="prop" style="margin-bottom:0"><input type="checkbox" id="iAnnot">'
+    +   "<span><b>Document annoté à la main</b>"
+    +   "<em>Force la lecture d'image sur toutes les pages du PDF. À cocher si tes traits au stylo "
+    +   "ne ressortent pas — sinon l'outil les détecte tout seul.</em></span></label>"
     + '<div><label class="lab" for="iHint">Précision facultative</label>'
     +   '<input class="field" id="iHint" placeholder="Ex. « TD du 3 octobre, suite du chapitre 2 »"></div>'
     + '<p class="note">Les pages qui se suivent sont regroupées en un seul document ; cours, exercices et corrigés sont séparés automatiquement.</p>'
@@ -2056,7 +2135,8 @@ function openImport(){
   }
   paint();
 
-  $("#iGo").onclick = ()=>lancerImport(files, $("#iM").value, $("#iHint").value.trim(), maxN, $("#iPaste").value.trim());
+  $("#iGo").onclick = ()=>lancerImport(files, $("#iM").value, $("#iHint").value.trim(), maxN,
+    $("#iPaste").value.trim(), $("#iAnnot") && $("#iAnnot").checked);
 }
 
 const SCHEMA_IMPORT = {
@@ -2082,7 +2162,7 @@ const SCHEMA_IMPORT = {
   additionalProperties:false
 };
 
-async function lancerImport(files, mid, hint, maxN, colle){
+async function lancerImport(files, mid, hint, maxN, colle, toutAnnote){
   if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir ⚙ Réglages."); return; }
   const estPDF = f => /\.pdf$/i.test(f.name) || f.type === "application/pdf";
   const imgs = files.filter(f=>f.type.startsWith("image/"));
@@ -2103,30 +2183,40 @@ async function lancerImport(files, mid, hint, maxN, colle){
   }
 
   /* ----- PDF : couche de texte d'abord, lecture d'image en dernier ----- */
-  let textePDF = "", bilanPDF = [];
+  let textePDF = "", bilanPDF = [], restant = 0;
   try{
     for(const f of pdfs){
-      const lu = await lirePDF(f, { signal: ch.signal,
+      const lu = await lirePDF(f, { signal: ch.signal, toutAnnote,
         onEtat: (i,n)=>{ const e=$("#iState"); if(e && e.querySelector(".thinking"))
           e.querySelector(".thinking").innerHTML = "<i></i>" + esc(f.name) + " — page " + i + "/" + n; } });
 
-      const aOCR = lu.pages.filter(p=>p.scan);
-      if(aOCR.length && IA.vision){
-        const plafond = Math.min(aOCR.length, 25);
+      // Toute page sans couche de texte, ou portant des traces manuscrites,
+      // demande une lecture d'image. Le plafond borne la dépense : au-delà,
+      // les pages restantes gardent leur texte imprimé sans les annotations.
+      const aLire = lu.pages.filter(p=>p.scan || p.annotee);
+      if(aLire.length && IA.vision){
+        const plafond = Math.min(aLire.length, PLAFOND_PAGES_IMAGE);
         for(let k = 0; k < plafond; k++){
-          const e = $("#iState");
+          const pg = aLire[k], e = $("#iState");
           if(e && e.querySelector(".thinking"))
-            e.querySelector(".thinking").innerHTML = "<i></i>" + esc(f.name)
-              + " — page scannée " + (k+1) + "/" + plafond + " (lecture d'image)";
-          try{ aOCR[k].texte = await ocrPagePDF(aOCR[k].page, ch.signal); }catch(e2){ aOCR[k].texte = ""; }
+            e.querySelector(".thinking").innerHTML = "<i></i>" + esc(f.name) + " — page " + pg.num
+              + " " + (pg.scan ? "scannée" : "annotée") + " (" + (k+1) + "/" + plafond + ")";
+          try{
+            pg.texte = pg.scan
+              ? await ocrPagePDF(pg.page, ch.signal)
+              : await lirePageAnnotee(pg.page, pg.texte, ch.signal);
+          }catch(e2){ /* on garde le texte extrait : mieux vaut sans annotations que rien */ }
         }
+        if(aLire.length > plafond) restant += aLire.length - plafond;
       }
 
       const utiles = lu.pages.filter(p=>p.texte);
       textePDF += "\n\n=== DOCUMENT : " + f.name + " ===\n"
         + utiles.map(p=>"\n[page " + p.num + "]\n" + p.texte).join("\n");
       bilanPDF.push(f.name + " : " + lu.total + " page" + (lu.total>1?"s":"")
-        + (lu.scannees ? ", dont " + lu.scannees + " scannée" + (lu.scannees>1?"s":"") : ""));
+        + (lu.scannees ? ", " + lu.scannees + " scannée" + (lu.scannees>1?"s":"") : "")
+        + (lu.annotees ? ", " + lu.annotees + " annotée" + (lu.annotees>1?"s":"") + " à la main" : "")
+        + (!lu.scannees && !lu.annotees ? ", texte pur" : ""));
     }
   }catch(e){
     ch.fini();
@@ -2137,7 +2227,12 @@ async function lancerImport(files, mid, hint, maxN, colle){
   }
 
   $("#iOut").innerHTML = bilanPDF.length
-    ? '<div class="card"><h4>PDF lus</h4><p class="note">' + esc(bilanPDF.join(" · ")) + "</p></div>"
+    ? '<div class="card"><h4>PDF lus</h4><p class="note">' + esc(bilanPDF.join(" · ")) + "</p>"
+      + (restant ? '<p class="note" style="color:var(--attention);margin-top:8px">'
+          + restant + " page(s) au-delà du plafond de " + PLAFOND_PAGES_IMAGE
+          + " : leur texte imprimé est bien repris, mais pas les annotations manuscrites. "
+          + "Découpe le PDF pour les récupérer.</p>" : "")
+      + "</div>"
     : '<div class="card"><p class="note">L\'agent lit chaque page, retranscrit intégralement et identifie de quel chapitre il s\'agit.</p></div>';
 
   const m = matById(mid), cs = chapsOf(mid);
