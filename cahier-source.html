@@ -467,6 +467,7 @@ const TYPES = {
   exercice: "Exercices",
   fiche:    "Fiche de révision",
   annale:   "Annale / Examen",
+  entrainement: "Entraînement",
   note:     "Note perso"
 };
 const STATUTS = {
@@ -794,6 +795,32 @@ function imageEnBase64(file, opts){
    Ces consignes demandent donc de restituer le sens de chaque marque,
    pas seulement les mots.
    ========================================================= */
+/* =========================================================
+   RÈGLE DE CLASSEMENT — par thème, jamais par étiquette
+   « Séance 4 », « TD 2 », « Chapitre 1 » disent où le professeur en était
+   dans son calendrier, pas de quoi le document parle. Deux séances peuvent
+   traiter la même notion, une même séance en aborder deux. Classer sur ces
+   étiquettes fabrique un classeur qui suit un emploi du temps au lieu de
+   suivre le savoir — et qui devient inutilisable pour réviser.
+   La numérotation des chapitres appartient à l'étudiant : elle vient du
+   programme qu'il colle, jamais d'un nom de fichier.
+   ========================================================= */
+const REGLE_THEME =
+  "RÈGLE DE CLASSEMENT — impérative :\n"
+  + "Classe toujours par THÈME, c'est-à-dire par la notion réellement traitée.\n"
+  + "Ignore complètement, pour décider du classement et pour nommer un thème, toute étiquette "
+  + "administrative : « Séance 3 », « TD 2 », « Cours n°5 », « Chapitre 1 », « Partie II », "
+  + "« Semaine 4 », « Fiche 7 », une date, un numéro de salle ou de groupe. Ces mentions "
+  + "renseignent le calendrier du professeur, pas le contenu.\n"
+  + "Un thème se nomme par son objet : « La fonction de consommation », « Les amortissements », "
+  + "« L'élasticité de la demande » — jamais « Séance 4 » ni « Chapitre 2 ».\n"
+  + "Deux documents étiquetés différemment mais traitant la même notion vont dans le MÊME thème. "
+  + "Un document couvrant deux notions distinctes se scinde en deux entrées.\n"
+  + "Les titres et intertitres du document sont au contraire précieux : c'est là que se lit le thème.\n"
+  + "Conserve l'étiquette administrative uniquement dans le TITRE DU DOCUMENT, où elle aide "
+  + "l'étudiant à retrouver sa séance — jamais dans le nom du thème.\n"
+  + "Ne propose aucun numéro de chapitre : la numérotation appartient à l'étudiant.";
+
 function consigneVision(contexte){
   return "Tu lis une page de cours d'un étudiant : notes manuscrites, polycopié annoté, "
     + "photo d'un tableau ou d'une diapositive.\n"
@@ -1943,8 +1970,21 @@ function chargerPDFJS(){
    d'une photocopie. */
 const SEUIL_PAGE_VIDE = 40;
 /* Chaque page lue en image est un appel au modèle : on borne pour qu'un poly
-   de deux cents pages ne se transforme pas en facture surprise. */
-const PLAFOND_PAGES_IMAGE = 40;
+   de deux cents pages ne se transforme pas en facture surprise. Seules les pages
+   SANS couche de texte (scans) et les pages annotées passent par là — un poly
+   numérique de 300 pages n'en consomme aucune. Réglable : les polys dépassent
+   couramment la trentaine de pages. */
+const S_PLAFOND = LS_KEY + "-plafond-pages";
+const PLAFONDS = [40, 80, 150];
+function plafondPages(){
+  try{
+    const v = Number(localStorage.getItem(S_PLAFOND));
+    return PLAFONDS.indexOf(v) >= 0 ? v : 80;
+  }catch(e){ return 80; }
+}
+function reglerPlafond(v){
+  try{ localStorage.setItem(S_PLAFOND, String(v)); }catch(e){}
+}
 
 /* Une page peut porter du texte ET des annotations manuscrites : un poly
    imprimé qu'on a surligné et entouré. L'extraction de texte seule les
@@ -2152,13 +2192,12 @@ const SCHEMA_IMPORT = {
         type:{type:"string", enum:["cours","td","exercice","fiche","annale","note"]},
         chapitreId:{type:"string"},
         chapitreTitre:{type:"string"},
-        chapitreNumero:{type:"integer"},
         pages:{type:"string"},
         transcription:{type:"string"},
         concepts:{type:"array", items:{type:"string"}},
         incertitudes:{type:"array", items:{type:"string"}}
       },
-      required:["titre","type","chapitreId","chapitreTitre","chapitreNumero","pages","transcription","concepts","incertitudes"],
+      required:["titre","type","chapitreId","chapitreTitre","pages","transcription","concepts","incertitudes"],
       additionalProperties:false }}
   },
   required:["documents"],
@@ -2198,7 +2237,7 @@ async function lancerImport(files, mid, hint, maxN, colle, toutAnnote){
       // les pages restantes gardent leur texte imprimé sans les annotations.
       const aLire = lu.pages.filter(p=>p.scan || p.annotee);
       if(aLire.length && IA.vision){
-        const plafond = Math.min(aLire.length, PLAFOND_PAGES_IMAGE);
+        const plafond = Math.min(aLire.length, plafondPages());
         for(let k = 0; k < plafond; k++){
           const pg = aLire[k], e = $("#iState");
           if(e && e.querySelector(".thinking"))
@@ -2232,21 +2271,22 @@ async function lancerImport(files, mid, hint, maxN, colle, toutAnnote){
   $("#iOut").innerHTML = bilanPDF.length
     ? '<div class="card"><h4>PDF lus</h4><p class="note">' + esc(bilanPDF.join(" · ")) + "</p>"
       + (restant ? '<p class="note" style="color:var(--attention);margin-top:8px">'
-          + restant + " page(s) au-delà du plafond de " + PLAFOND_PAGES_IMAGE
+          + restant + " page(s) au-delà du plafond de " + plafondPages()
           + " : leur texte imprimé est bien repris, mais pas les annotations manuscrites. "
-          + "Découpe le PDF pour les récupérer.</p>" : "")
+          + "Relève le plafond dans ⚙ Réglages, ou découpe le PDF.</p>" : "")
       + "</div>"
     : '<div class="card"><p class="note">L\'agent lit chaque page, retranscrit intégralement et identifie de quel chapitre il s\'agit.</p></div>';
 
   const m = matById(mid), cs = chapsOf(mid);
-  const liste = cs.length ? cs.map(c=>'- id "'+c.id+'" · Ch. '+(c.numero||"?")+" — "+c.titre).join("\n") : "(aucun chapitre existant)";
+  const liste = cs.length ? cs.map(c=>'- id "'+c.id+'" · "'+c.titre+'"').join("\n") : "(aucun thème existant)";
 
   const avecImages = imgs.length > 0 && IA.vision;
 
   const prompt = "Tu retranscris et classes des documents de cours de la matière « " + (m?m.nom:"?") + " ».\n"
     + (avecImages ? "Les "+imgs.length+" image(s) jointes sont des photos de notes manuscrites, de polycopiés, de tableaux ou de slides, dans l'ordre où elles ont été prises.\n" : "")
     + (hint ? "Précision donnée par l'étudiant : « "+hint+" ».\n" : "")
-    + "\nCHAPITRES DÉJÀ EXISTANTS dans cette matière :\n" + liste + "\n"
+    + "\n" + REGLE_THEME + "\n"
+    + "\nTHÈMES DÉJÀ EXISTANTS dans cette matière — à réutiliser en priorité :\n" + liste + "\n"
     + (colle ? "\nTEXTE FOURNI PAR L'ÉTUDIANT :\n" + colle.slice(0,34000) + "\n" : "")
     + (annexes ? "\nCONTENU DES FICHIERS JOINTS :" + annexes + "\n" : "")
     + "\nTravail à faire :\n"
@@ -2254,12 +2294,19 @@ async function lancerImport(files, mid, hint, maxN, colle, toutAnnote){
     + (avecImages ? consigneVision("").split("RESTITUE LE TEXTE")[1].split("RENDU")[0].trim() + "\n"
                   : "Tout le texte, titres, numérotation, définitions, formules (LaTeX entre $…$), tableaux (markdown). "
                     + "Ne résume pas, ne saute rien, n'invente rien. Marque `[illisible]` là où tu n'es pas sûr.\n")
-    + "2. REGROUPE les pages qui se suivent et appartiennent au même document en une seule entrée ; SÉPARE en entrées distinctes ce qui est de nature différente (cours / exercices / corrigé) ou d'un chapitre différent.\n"
-    + "3. CLASSE chaque entrée : réutilise l'id d'un chapitre existant si le contenu y correspond, sinon propose un nouveau chapitre.\n\n"
+    + "2. REGROUPE les pages qui se suivent et traitent la même notion en une seule entrée ; SÉPARE en entrées "
+    + "distinctes ce qui est de nature différente (cours / exercices / corrigé) ou d'un THÈME différent. "
+    + "Une rupture de séance n'est pas une rupture de thème : si la séance 5 poursuit la notion de la séance 4, "
+    + "les deux vont ensemble.\n"
+    + "3. CLASSE chaque entrée par THÈME : réutilise l'id d'un thème existant dès que le contenu s'y rattache, "
+    + "même si le document porte une étiquette de séance différente. Ne crée un thème que pour une notion "
+    + "réellement nouvelle.\n"
+    + "4. TITRE DU DOCUMENT : court, explicite, et tu peux y garder l'étiquette d'origine "
+    + "(« Séance 4 — Exercices sur la propension à consommer ») pour que l'étudiant retrouve son fichier.\n\n"
     + 'Réponds UNIQUEMENT avec ce JSON :\n'
     + '{"documents":[{"titre":"titre court et explicite","type":"cours|td|exercice|fiche|annale|note",'
-    + '"chapitreId":"id d\'un chapitre existant, ou chaîne vide pour un nouveau chapitre",'
-    + '"chapitreTitre":"titre du chapitre (existant ou proposé)","chapitreNumero":3,'
+    + '"chapitreId":"id d\'un thème existant, ou chaîne vide pour un nouveau thème",'
+    + '"chapitreTitre":"nom du THÈME (existant ou proposé) — jamais une étiquette de séance",'
     + '"pages":"1-2","transcription":"le document complet en markdown","concepts":["notion 1"],"incertitudes":["passage illisible ou douteux"]}]}';
 
   const appeler = (withImages, tranche, dejaProposes) => iaJson({
@@ -2429,6 +2476,8 @@ function openProgramme(mid){
     + "</select></div>"
     + '<div><label class="lab" for="pgTxt">Colle ici le programme donné par ton prof</label>'
     +   '<textarea class="field" id="pgTxt" rows="10" placeholder="Plan du cours, liste des séances, thèmes, dates… tel que tu l\'as reçu. Le format n\'a pas d\'importance."></textarea>'
+    +   '<div style="margin-top:8px"><button class="btn fantome sm" id="pgFichierBtn">Ou déposer le programme (PDF, texte)</button>'
+    +   '<input type="file" id="pgFichier" accept=".pdf,.txt,.md,.csv" class="sr"></div>'
     +   '<p class="note" style="margin-top:8px">Chaque élément deviendra un chapitre de ta matière. Tes chapitres existants ne sont pas touchés : '
     +   'si un titre correspond déjà, il est laissé tel quel.</p></div>'
     + '<div id="pgOut"></div>'
@@ -2438,6 +2487,40 @@ function openProgramme(mid){
 
   document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
   $("#pgTxt").focus();
+
+  // Le programme arrive souvent en PDF plutôt qu'en copier-coller. On en extrait
+  // la couche de texte et on la verse dans le champ : l'étudiant voit ce qui a été
+  // lu et peut le corriger avant de structurer.
+  $("#pgFichierBtn").onclick = ()=> $("#pgFichier").click();
+  $("#pgFichier").onchange = async e=>{
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if(!f) return;
+    const etat = $("#pgEtat");
+    try{
+      let txt = "";
+      if(/\.pdf$/i.test(f.name) || f.type === "application/pdf"){
+        etat.textContent = "Lecture du PDF…";
+        const r = await lirePDF(f, { onEtat:(i,n)=>{ etat.textContent = "Lecture du PDF — page "+i+"/"+n; } });
+        txt = r.pages.map(p=>p.texte || "").join("\n").trim();
+        if(!txt){
+          etat.textContent = "";
+          toast("Ce PDF est scanné : aucun texte à extraire. Passe par « Importer » pour le faire lire en image.", 6000);
+          return;
+        }
+        if(r.scannees) toast(r.scannees + " page(s) sans texte ont été ignorées.", 4500);
+      }else{
+        txt = (await f.text()).trim();
+      }
+      const champ = $("#pgTxt");
+      champ.value = (champ.value.trim() ? champ.value.trim() + "\n\n" : "") + txt;
+      etat.textContent = "";
+      toast("Programme chargé depuis « " + f.name + " » — relis-le avant de structurer.", 5000);
+    }catch(err){
+      etat.textContent = "";
+      toast("Lecture impossible : " + (err && err.message ? err.message : "erreur"), 5000);
+    }
+  };
 
   $("#pgGo").onclick = async ()=>{
     const txt = $("#pgTxt").value.trim(), mid2 = $("#pgM").value;
@@ -2452,14 +2535,20 @@ function openProgramme(mid){
         system: NIVEAU,
         messages: [{ role:"user", content:
           "Voici le programme d'un semestre en « " + (m?m.nom:"?") + " », tel que le professeur l'a communiqué.\n\n"
-          + txt.slice(0,20000) + "\n\n"
-          + "Transforme-le en une liste ordonnée de chapitres. Règles :\n"
-          + "- un chapitre par unité d'enseignement identifiable (séance, thème, partie) ;\n"
-          + "- \"titre\" reprend les mots du programme, sans les reformuler ni les enjoliver ;\n"
+          + txt.slice(0,60000) + "\n\n"
+          + REGLE_THEME + "\n\n"
+          + "Transforme-le en une liste ordonnée de THÈMES. Règles :\n"
+          + "- un thème par notion enseignée ; si deux séances consécutives poursuivent la même notion, "
+          + "elles forment UN seul thème ;\n"
+          + "- \"titre\" reprend les mots de contenu du programme, sans les reformuler ni les enjoliver, mais "
+          + "DÉBARRASSÉS de leur étiquette de calendrier : « Séance 4 — La fonction de consommation » devient "
+          + "« La fonction de consommation ». Si une ligne ne porte qu'une étiquette et aucun contenu, déduis le "
+          + "titre des notions listées en dessous ;\n"
           + "- \"objectifs\" : 1 à 3 compétences visées, formulées à l'infinitif, uniquement si le programme les indique ou les implique clairement ;\n"
           + "- \"notions\" : les termes techniques cités dans le programme pour ce chapitre ;\n"
-          + "- \"periode\" : la date ou la semaine si le programme en donne une, sinon une chaîne vide.\n"
-          + "N'invente aucun chapitre absent du programme." }],
+          + "- \"periode\" : c'est ICI que va l'étiquette d'origine — « Séance 4 », « Semaine 3 », une date — "
+          + "telle que le programme l'écrit, sinon une chaîne vide.\n"
+          + "N'invente aucun thème absent du programme." }],
         // Structurer un plan est une extraction, pas un raisonnement :
         // l'effort minimal suffit et raccourcit nettement l'attente.
         schema: SCHEMA_PROGRAMME, effort: "low", maxTokens: 8000
@@ -2602,6 +2691,72 @@ async function preparerChapitre(cid){
 }
 
 /* =========================================================
+   ENTRAÎNEMENT — des exercices tirés du thème lui-même
+   Le classeur devient une base de connaissances : les exercices ne sortent
+   pas d'un fonds générique, ils sont bâtis sur les documents que l'étudiant
+   a réellement importés pour ce thème — mêmes notations, mêmes conventions,
+   même profondeur que ce que son professeur traite.
+   ========================================================= */
+async function entrainerChapitre(cid){
+  const c = chapById(cid); if(!c) return;
+  if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
+  const m = matById(c.matiereId), its = itemsOf(c.id);
+
+  showPanel(); state.tab = "analyse";
+  $("#panelBody").innerHTML = '<div class="card"><div id="exEtat"></div>'
+    + '<div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
+  const ch = chantier($("#exEtat"), "Rédaction des exercices", { delai: 240000 });
+
+  // Sans document, on ne peut s'appuyer que sur ce que le programme annonce :
+  // on le dit à l'étudiant plutôt que de fabriquer du hors-sujet en silence.
+  const ancre = its.length > 0;
+  const base = ancre
+    ? "DOCUMENTS DE CE THÈME — c'est ta seule source :\n\n" + ctxChapitre(c, 30000)
+    : "MATIÈRE : " + (m?m.nom:"?") + "\nTHÈME : " + c.titre
+      + (c.notions && c.notions.length ? "\nNotions annoncées au programme : " + c.notions.join(", ") : "")
+      + (c.objectifs && c.objectifs.length ? "\nObjectifs annoncés : " + c.objectifs.join(" ; ") : "")
+      + "\n\n(Aucun document importé pour ce thème : appuie-toi sur le contenu standard du sujet.)";
+
+  try{
+    const texte = await iaTexte({
+      system: NIVEAU + "\n\nTu fabriques des exercices d'entraînement. Tu ne testes que ce qui est "
+        + "effectivement traité dans les documents fournis : ni plus difficile, ni hors-programme.",
+      messages: [{ role:"user", content:
+        base + "\n\n"
+        + "Rédige une série d'entraînement sur le thème « " + c.titre + " » en markdown, structurée ainsi :\n"
+        + "## Énoncés\n"
+        + "Six exercices numérotés, de difficulté croissante : deux d'application directe, trois de "
+        + "raisonnement, un plus exigeant qui combine plusieurs notions du thème.\n"
+        + "## Corrigés\n"
+        + "Pour chaque exercice, la démarche détaillée étape par étape, puis le résultat. Montre le "
+        + "raisonnement, pas seulement la réponse.\n"
+        + "## Ce que chaque exercice vérifie\n"
+        + "Une ligne par exercice, nommant la notion testée.\n\n"
+        + (ancre
+            ? "IMPÉRATIF : reprends EXACTEMENT les notations, symboles, conventions et vocabulaire des "
+              + "documents ci-dessus — c'est ainsi que le professeur les écrit. N'introduis aucune notion "
+              + "absente de ces documents. Si les documents contiennent déjà des exercices, inspire-t'en "
+              + "pour le style et le niveau, mais propose des énoncés NOUVEAUX, avec d'autres valeurs.\n"
+            : "")
+        + "Formules en LaTeX entre $…$, tableaux en markdown. Les valeurs numériques doivent tomber juste "
+        + "ou presque : vérifie tes calculs avant d'écrire le corrigé." }],
+      effort: "high", maxTokens: 16000, signal: ch.signal,
+      onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
+    });
+
+    const it = { id:uid(), matiereId:c.matiereId, chapitreId:cid, type:"entrainement",
+      titre:"Entraînement — " + c.titre, contenu: texte, source:"ia", ancre,
+      date:new Date().toISOString() };
+    ch.fini();
+    state.items.push(it); await saveItem(it);
+    state.openDocs.add(it.id);
+    aller("chapitre", { chap:cid, mat:c.matiereId });
+    toast(ancre ? "Exercices créés à partir de tes " + its.length + " document(s)"
+                : "Exercices créés — aucun document dans ce thème, contenu générique");
+  }catch(e){ ch.fini(); iaError(e); renderPanel(); }
+}
+
+/* =========================================================
    RANGEMENT D'UNE MATIÈRE
    Le classement fait à l'import est aveugle au reste : il ne voit que ce
    qu'on lui donne. Après plusieurs imports, des chapitres se dédoublent et
@@ -2702,13 +2857,18 @@ async function rangerMatiere(mid){
       const r1 = await iaJson({
         system: NIVEAU,
         messages:[{ role:"user", content:
-          "Voici les chapitres de la matière « " + m.nom + " » d'un classeur de cours.\n\n" + inventaire + "\n\n"
+          "Voici les thèmes de la matière « " + m.nom + " » d'un classeur de cours.\n\n" + inventaire + "\n\n"
+          + REGLE_THEME + "\n\n"
           + "Repère les défauts de structure et propose un plan de rangement :\n"
-          + "1. FUSIONS : deux chapitres qui désignent manifestement la même chose (« Amortissements » et « Les amortissements », "
-          + "ou un chapitre créé en double lors d'un import découpé). Indique lequel garder, lesquels absorber, et le titre final. "
-          + "Ne fusionne JAMAIS deux chapitres qui traitent de sujets distincts, même proches.\n"
-          + "2. RENOMMAGES : uniquement si un titre est manifestement tronqué, mal orthographié, ou porte un numéro de tranche "
-          + "parasite (« Partie 3 »). Sinon laisse le titre tel quel — c'est celui du professeur.\n"
+          + "1. FUSIONS : deux entrées qui désignent manifestement la même notion — « Amortissements » et "
+          + "« Les amortissements », un thème créé en double lors d'un import découpé, ou surtout deux étiquettes "
+          + "de calendrier différentes portant sur le même sujet (« Séance 4 » et « Séance 5 » qui traitent toutes "
+          + "deux de la fonction de consommation). Indique lequel garder, lesquels absorber, et le titre final, "
+          + "qui doit nommer la notion. Ne fusionne JAMAIS deux notions distinctes, même proches.\n"
+          + "2. RENOMMAGES : renomme impérativement tout titre qui n'est qu'une étiquette administrative "
+          + "(« Séance 3 », « TD 2 », « Chapitre 1 », « Partie 3 », une date) — remplace-le par la notion que "
+          + "révèlent les documents qu'il contient. Renomme aussi un titre tronqué ou mal orthographié. "
+          + "Sinon laisse le titre tel quel.\n"
           + "3. ORDRE : la liste complète des id de chapitres, dans l'ordre pédagogique logique. Conserve l'ordre existant "
           + "s'il est cohérent ; ne réordonne que si un chapitre est visiblement mal placé.\n\n"
           + "Sois conservateur : en cas de doute, ne propose rien. Un classeur mal fusionné est pire qu'un classeur imparfait." }],
@@ -2750,10 +2910,12 @@ async function rangerMatiere(mid){
         const r2 = await iaJson({
           system: NIVEAU,
           messages:[{ role:"user", content:
-            "Chapitres disponibles dans la matière « " + m.nom + " » :\n" + listeCible + "\n\n"
+            "Thèmes disponibles dans la matière « " + m.nom + " » :\n" + listeCible + "\n\n"
+            + REGLE_THEME + "\n\n"
             + "Documents à vérifier :\n" + desc + "\n\n"
-            + "1. DÉPLACEMENTS : pour chaque document manifestement rangé dans le mauvais chapitre, indique son id "
-            + "et l'id du chapitre qui lui convient. N'utilise que les id de la liste ci-dessus. "
+            + "1. DÉPLACEMENTS : pour chaque document manifestement rangé sous le mauvais thème, indique son id "
+            + "et l'id du thème qui lui convient — d'après la notion qu'il traite, jamais d'après l'étiquette de "
+            + "séance figurant dans son titre. N'utilise que les id de la liste ci-dessus. "
             + "Ne propose RIEN pour un document déjà bien placé — la liste doit être courte.\n"
             + "2. DOUBLONS : deux documents dont le contenu se recouvre presque entièrement (même page importée deux fois). "
             + "Indique lequel garder et lesquels supprimer. Un cours et son exercice ne sont PAS des doublons ; "
@@ -3399,6 +3561,7 @@ function vueChapitre(){
     +   (its.length
         ? '<button class="btn pri sm" data-analyse="'+c.id+'">'+(a?"Relancer l'analyse":"Analyser ce chapitre")+"</button>"
         : '<button class="btn pri sm" data-preparer="'+c.id+'">Préparer ce chapitre</button>')
+    +   '<button class="btn sm" data-exos="'+c.id+'">✎ M\'entraîner</button>'
     +   '<button class="btn sm" data-question="'+c.id+'">Poser une question</button>'
     +   '<button class="btn sm" data-import="1">＋ Photos / PDF</button>'
     +   '<button class="btn sm" data-ecrire="'+c.id+'">✎ Écrire</button>'
@@ -3578,6 +3741,14 @@ function vueReglages(){
     +   "</div>"
     +   '<div class="doc-actions"><button class="btn pri sm" id="rEpreuve">Lancer l\'épreuve</button></div>'
     +   '<div id="rEpOut"></div></div>'
+    + '<div class="card"><h4>Gros PDF</h4>'
+    +   '<p class="note">Un PDF numérique est lu par sa couche de texte, sans limite de pages. Ce plafond ne '
+    +   "concerne que les pages <b>scannées ou annotées à la main</b>, qui doivent être regardées une par une.</p>"
+    +   '<div class="seg" style="margin-top:10px" id="rPlaf">'
+    +     PLAFONDS.map(v=>'<button data-p="'+v+'" aria-pressed="'+(plafondPages()===v)+'">'+v+" pages</button>").join("")
+    +   "</div>"
+    +   '<p class="note" style="margin-top:8px">Au-delà, le texte imprimé reste repris — seules les annotations '
+    +   "manuscrites de ces pages sont perdues.</p></div>"
     + '<div class="card"><h4>Matières</h4><p class="note">'+state.matieres.length+" matière"+(state.matieres.length>1?"s":"")+" · modifie la liste, les codes et les profs.</p>"
     +   '<div class="doc-actions"><button class="btn sm" id="rMat">Gérer mes matières</button></div></div>'
     + '<div class="card"><h4>Apparence</h4><p class="note">Le cahier suit ton système. Tu peux forcer un mode.</p>'
@@ -3594,6 +3765,7 @@ function vueReglages(){
 
   $("#rIA").onclick = openSettings;
   $("#rQual").querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{ reglerQualite(b.dataset.q); vueReglages(); });
+  $("#rPlaf").querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{ reglerPlafond(Number(b.dataset.p)); vueReglages(); });
   $("#rEpreuve").onclick = async ()=>{
     const btn = $("#rEpreuve"), out = $("#rEpOut");
     if(IA.mode === "off" || !IA.vision){
@@ -3628,7 +3800,11 @@ function vueReglages(){
   $("#rMat").onclick = openMatieresModal;
   $("#rExp").onclick = exporterJSON;
   $("#rImp").onclick = importerJSON;
-  const th = localStorage.getItem(LS_KEY+"-theme") || "auto";
+  // Lecture protégée comme partout ailleurs : un navigateur qui refuse le
+  // stockage (navigation privée stricte) faisait autrement échouer tout le
+  // câblage de cet écran à partir d'ici.
+  let th = "auto";
+  try{ th = localStorage.getItem(LS_KEY+"-theme") || "auto"; }catch(e){}
   $("#rTheme").querySelectorAll("[data-theme]").forEach(b=>{
     b.setAttribute("aria-pressed", String(b.dataset.theme === th));
     b.onclick = ()=>{ appliquerTheme(b.dataset.theme); vueReglages(); };
@@ -3698,6 +3874,7 @@ function câbler(scene){
   q("[data-ranger]").forEach(b=>b.onclick=()=>rangerMatiere(state.selMat));
   q("[data-deplacer]").forEach(b=>b.onclick=()=>deplacerDoc(b.dataset.deplacer));
   q("[data-preparer]").forEach(b=>b.onclick=()=>preparerChapitre(b.dataset.preparer));
+  q("[data-exos]").forEach(b=>b.onclick=()=>entrainerChapitre(b.dataset.exos));
   q("[data-editmat]").forEach(b=>b.onclick=openMatieresModal);
   q("[data-editchap]").forEach(b=>b.onclick=()=>openChapModal(b.dataset.editchap));
   q("[data-delchap]").forEach(b=>b.onclick=()=>delChapitre(b.dataset.delchap));
