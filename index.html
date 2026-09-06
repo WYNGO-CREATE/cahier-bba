@@ -476,6 +476,7 @@ const TYPES = {
   fiche:    "Fiche de révision",
   annale:   "Annale / Examen",
   entrainement: "Entraînement",
+  evaluation: "Préparation d'épreuve",
   note:     "Note perso"
 };
 const STATUTS = {
@@ -2705,6 +2706,38 @@ async function preparerChapitre(cid){
    a réellement importés pour ce thème — mêmes notations, mêmes conventions,
    même profondeur que ce que son professeur traite.
    ========================================================= */
+// Depuis la feuille de création, aucun thème n'est forcément ouvert :
+// on demande lequel avant de lancer.
+function openEntrainement(mid, cidPre){
+  if(!state.matieres.length){ openMatieresModal(); return; }
+  mid = mid || state.selMat || state.matieres[0].id;
+  if(cidPre && chapById(cidPre)) return entrainerChapitre(cidPre);
+
+  const optMat = () => state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===mid?" selected":"")+">"+esc(m.nom)+"</option>").join("");
+  const optChap = mm => { const cs = chapsOf(mm);
+    return cs.length ? cs.map(c=>'<option value="'+c.id+'">'+esc(c.titre)+"</option>").join("")
+                     : '<option value="">(aucun thème dans cette matière)</option>'; };
+
+  modal('<div class="modal-head"><h2>M\'entraîner</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><div class="stack">'
+    + '<p class="note">Six exercices de difficulté croissante avec leurs corrigés, bâtis sur les documents '
+    + "que tu as importés pour ce thème — mêmes notations, mêmes conventions que ton professeur.</p>"
+    + '<div class="grid2">'
+    +   '<div><label class="lab" for="enM">Matière</label><select class="field" id="enM">'+optMat()+"</select></div>"
+    +   '<div><label class="lab" for="enC">Thème</label><select class="field" id="enC">'+optChap(mid)+"</select></div>"
+    + "</div></div></div>"
+    + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Annuler</button>'
+    + '<button class="btn pri" id="enGo">Créer les exercices</button></div>', {wide:true});
+
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+  $("#enM").onchange = ()=>{ $("#enC").innerHTML = optChap($("#enM").value); };
+  $("#enGo").onclick = ()=>{
+    const cid = $("#enC").value;
+    if(!cid){ toast("Cette matière n'a encore aucun thème."); return; }
+    closeModal(); entrainerChapitre(cid);
+  };
+}
+
 async function entrainerChapitre(cid){
   const c = chapById(cid); if(!c) return;
   if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
@@ -2761,6 +2794,141 @@ async function entrainerChapitre(cid){
     aller("chapitre", { chap:cid, mat:c.matiereId });
     toast(ancre ? "Exercices créés à partir de tes " + its.length + " document(s)"
                 : "Exercices créés — aucun document dans ce thème, contenu générique");
+  }catch(e){ ch.fini(); iaError(e); renderPanel(); }
+}
+
+/* =========================================================
+   MODE ÉVALUATION — préparer une épreuve pour de vrai
+   L'idée de Hugo : les annales de la matière disent la FORME que prend
+   l'épreuve (structure, type de questions, barème, durée), et les documents
+   du thème disent le FOND. On croise les deux, au lieu de produire une fiche
+   de révision générique qui ne ressemble à aucun sujet réel.
+   ========================================================= */
+function annalesDe(mid, maxChars){
+  // Les sujets passés, toutes années confondues : c'est le gabarit de l'épreuve.
+  const an = itemsOfMat(mid).filter(i => i.type === "annale");
+  if(!an.length) return { texte:"", nb:0 };
+  const budget = maxChars || 16000;
+  const part = Math.max(900, Math.floor(budget / Math.min(an.length, 8)));
+  let txt = "";
+  an.slice(0, 8).forEach(i=>{
+    const c = String(i.contenu || "");
+    txt += "\n=== SUJET : " + (i.titre || "sans titre") + " ===\n"
+        + (c.length > part ? c.slice(0, part) + "\n[…]" : c) + "\n";
+  });
+  return { texte: txt.slice(0, budget + 400), nb: an.length };
+}
+
+function openEvaluation(mid, cidPre){
+  if(!state.matieres.length){ openMatieresModal(); return; }
+  mid = mid || state.selMat || state.matieres[0].id;
+
+  const optMat = () => state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===mid?" selected":"")+">"+esc(m.nom)+"</option>").join("");
+  const optChap = (mm, sel) => '<option value="">Toute la matière</option>'
+    + chapsOf(mm).map(c=>'<option value="'+c.id+'"'+(c.id===sel?" selected":"")+">"+esc(c.titre)+"</option>").join("");
+
+  modal('<div class="modal-head"><h2>Préparer une épreuve</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><div class="stack">'
+    + '<p class="note">L\'agent lit les <b>annales</b> de la matière pour en déduire la forme réelle de l\'épreuve, '
+    + "puis s'appuie sur tes documents du thème pour le contenu. Tu obtiens le format attendu, ce qui revient le plus "
+    + "souvent, une fiche ciblée et un sujet blanc inédit avec son corrigé.</p>"
+    + '<div class="grid2">'
+    +   '<div><label class="lab" for="evM">Matière</label><select class="field" id="evM">'+optMat()+"</select></div>"
+    +   '<div><label class="lab" for="evC">Thème</label><select class="field" id="evC">'+optChap(mid, cidPre)+"</select></div>"
+    + "</div>"
+    + '<div><label class="lab" for="evT">Type d\'épreuve</label><select class="field" id="evT">'
+    +   '<option value="auto">Déduire des annales</option>'
+    +   '<option value="midterm">Partiel / mi-parcours</option>'
+    +   '<option value="final">Examen final</option>'
+    +   '<option value="oral">Oral</option>'
+    +   '<option value="qcm">QCM</option>'
+    + "</select></div>"
+    + '<div><label class="lab" for="evD">Dans combien de temps ? (facultatif)</label>'
+    +   '<input class="field" id="evD" placeholder="ex. 3 jours, la semaine prochaine"></div>'
+    + '<div id="evEtat"></div>'
+    + "</div></div>"
+    + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Annuler</button>'
+    + '<button class="btn pri" id="evGo">Préparer</button></div>', {wide:true, sticky:true});
+
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+  $("#evM").onchange = ()=>{ $("#evC").innerHTML = optChap($("#evM").value, ""); };
+  $("#evGo").onclick = ()=> preparerEvaluation($("#evM").value, $("#evC").value,
+      { type: $("#evT").value, delai: $("#evD").value.trim() });
+}
+
+async function preparerEvaluation(mid, cid, opt){
+  opt = opt || {};
+  if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
+  const m = matById(mid); if(!m) return;
+  const c = cid ? chapById(cid) : null;
+
+  const btn = $("#evGo"); if(btn) btn.disabled = true;
+  // Le panneau doit exister avant le chantier : son compteur ne peint que sur
+  // une cible encore attachée au document.
+  closeModal();
+  showPanel(); state.tab = "analyse";
+  $("#panelBody").innerHTML = '<div class="card"><div id="evEtat2"></div>'
+    + '<div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
+  const ch = chantier($("#evEtat2"), "Lecture des annales et des cours", { delai: 300000 });
+
+  const an = annalesDe(mid);
+  // Sans thème choisi, on prend un aperçu de toute la matière plutôt que rien.
+  const fond = c ? ctxChapitre(c, 20000)
+    : itemsOfMat(mid).filter(i=>i.type!=="annale").slice(0,25)
+        .map(i=>"--- " + (TYPES[i.type]||i.type) + " : " + (i.titre||"") + " ---\n"
+                + String(i.contenu||"").slice(0,900)).join("\n\n").slice(0,20000);
+
+  const nomEpreuve = { auto:"", midterm:"un partiel de mi-parcours", final:"un examen final",
+                       oral:"un oral", qcm:"un QCM" }[opt.type] || "";
+
+  try{
+    const texte = await iaTexte({
+      system: NIVEAU + "\n\nTu prépares un étudiant à une épreuve précise. Tu ne fais pas de révision "
+        + "générique : tu pars de la forme réelle des sujets déjà tombés et du contenu réellement enseigné.",
+      messages:[{ role:"user", content:
+        "MATIÈRE : " + m.nom + "\n"
+        + "THÈME VISÉ : " + (c ? c.titre : "toute la matière") + "\n"
+        + (nomEpreuve ? "TYPE D'ÉPREUVE : " + nomEpreuve + "\n" : "")
+        + (opt.delai ? "ÉCHÉANCE : " + opt.delai + "\n" : "")
+        + "\n" + (an.nb
+            ? "ANNALES DE LA MATIÈRE (" + an.nb + " sujet(s) retrouvé(s) dans le cahier) — "
+              + "c'est de LÀ que tu déduis la forme de l'épreuve :\n" + an.texte + "\n"
+            : "AUCUNE ANNALE dans le cahier pour cette matière : dis-le explicitement en tête de ta réponse, "
+              + "et propose une forme d'épreuve plausible en la présentant comme une hypothèse.\n")
+        + "\nDOCUMENTS DU THÈME — c'est de LÀ que vient le contenu :\n" + fond + "\n\n"
+        + "Rédige une préparation en markdown, structurée ainsi :\n"
+        + "## Ce qui t'attend\n"
+        + "La forme de l'épreuve telle que les annales la révèlent : structure, nombre et type de questions, "
+        + "durée et barème si le sujet les indique, place du calcul face à la rédaction. Cite les sujets sur "
+        + "lesquels tu t'appuies. Si les annales divergent entre elles, dis-le.\n"
+        + "## Ce qui revient le plus souvent\n"
+        + "Les notions présentes dans plusieurs sujets, classées de la plus à la moins récurrente. "
+        + "Pour chacune, précise sous quelle forme elle est interrogée.\n"
+        + "## Fiche ciblée\n"
+        + "Uniquement ce qui sert pour cette épreuve : définitions exactes, formules, méthodes pas à pas. "
+        + "Reprends les notations des documents. Pas de digression.\n"
+        + "## Sujet blanc\n"
+        + "Un sujet inédit, calqué sur la forme des annales, avec le barème. N'y recopie aucun exercice existant.\n"
+        + "## Corrigé du sujet blanc\n"
+        + "La correction détaillée, étape par étape.\n"
+        + "## Pièges et erreurs fréquentes\n"
+        + "Ce sur quoi les étudiants se trompent, d'après les corrigés présents dans les annales.\n\n"
+        + "Formules en LaTeX entre $…$, tableaux en markdown. Vérifie tes calculs avant d'écrire le corrigé. "
+        + "N'invente jamais une notion absente des documents fournis." }],
+      effort:"high", maxTokens: 20000, signal: ch.signal,
+      onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
+    });
+
+    const it = { id:uid(), matiereId:mid, chapitreId: cid || (chapsOf(mid)[0]||{}).id || null,
+      type:"evaluation", titre:"Préparation — " + (c ? c.titre : m.nom),
+      contenu: texte, source:"ia", ancre: an.nb>0, date:new Date().toISOString() };
+    ch.fini();
+    state.items.push(it); await saveItem(it);
+    state.openDocs.add(it.id);
+    if(it.chapitreId) aller("chapitre", { chap: it.chapitreId, mat: mid });
+    else aller("matiere", { mat: mid });
+    toast(an.nb ? "Préparation créée à partir de " + an.nb + " annale(s)"
+                : "Préparation créée — aucune annale trouvée dans cette matière");
   }catch(e){ ch.fini(); iaError(e); renderPanel(); }
 }
 
@@ -3317,6 +3485,8 @@ function openCreation(){
 
   modal('<div class="modal-head"><h2>Ajouter au cahier</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
     + '<div class="modal-body"><div class="creation-liste">'
+    + ligne("evaluation","◎","Préparer une épreuve","À partir des annales de la matière et de tes cours")
+    + ligne("entrainer","✎","M\'entraîner sur un thème","Exercices et corrigés bâtis sur tes documents")
     + ligne("photo","▣","Importer photos et PDF","Polys, scans, photos de notes — lus, triés et rangés")
     + ligne("texte","✎","Écrire un cours","Saisir ou coller, avec mise au propre")
     + ligne("programme","☰","Coller le programme", m ? "Le semestre de « "+m.nom+" » en chapitres" : "Le semestre en chapitres")
@@ -3328,6 +3498,8 @@ function openCreation(){
   document.querySelectorAll("[data-faire]").forEach(b=>b.onclick=()=>{
     const quoi = b.dataset.faire;
     closeModal();
+    if(quoi === "evaluation") return openEvaluation(state.selMat, state.vue === "chapitre" ? state.selChap : "");
+    if(quoi === "entrainer")  return openEntrainement(state.selMat, state.vue === "chapitre" ? state.selChap : "");
     if(quoi === "photo")     return openImport();
     if(quoi === "texte")     return openEditor(state.vue === "chapitre" && state.selChap ? { chapitreId: state.selChap } : {});
     if(quoi === "programme") return openProgramme(state.selMat);
@@ -3508,6 +3680,7 @@ function vueMatiere(){
     + '<div class="doc-actions" style="margin:6px 0 4px">'
     +   '<button class="btn pri sm" data-import="1">＋ Photos / PDF</button>'
     +   '<button class="btn sm" data-ecrire="">✎ Écrire</button>'
+    +   '<button class="btn sm" data-evalmat="1">◎ Préparer une épreuve</button>'
     +   '<button class="btn sm" data-programme="1">☰ Programme</button>'
     +   '<button class="btn sm" data-ranger="1">⇄ Ranger</button>'
     +   '<button class="btn sm" data-newchap="1">Chapitre</button>'
@@ -3569,6 +3742,7 @@ function vueChapitre(){
     +   (its.length
         ? '<button class="btn pri sm" data-analyse="'+c.id+'">'+(a?"Relancer l'analyse":"Analyser ce chapitre")+"</button>"
         : '<button class="btn pri sm" data-preparer="'+c.id+'">Préparer ce chapitre</button>')
+    +   '<button class="btn sm" data-eval="'+c.id+'">◎ Préparer une épreuve</button>'
     +   '<button class="btn sm" data-exos="'+c.id+'">✎ M\'entraîner</button>'
     +   '<button class="btn sm" data-question="'+c.id+'">Poser une question</button>'
     +   '<button class="btn sm" data-import="1">＋ Photos / PDF</button>'
@@ -3883,6 +4057,8 @@ function câbler(scene){
   q("[data-deplacer]").forEach(b=>b.onclick=()=>deplacerDoc(b.dataset.deplacer));
   q("[data-preparer]").forEach(b=>b.onclick=()=>preparerChapitre(b.dataset.preparer));
   q("[data-exos]").forEach(b=>b.onclick=()=>entrainerChapitre(b.dataset.exos));
+  q("[data-eval]").forEach(b=>b.onclick=()=>{ const c=chapById(b.dataset.eval); openEvaluation(c?c.matiereId:state.selMat, b.dataset.eval); });
+  q("[data-evalmat]").forEach(b=>b.onclick=()=>openEvaluation(state.selMat, ""));
   q("[data-editmat]").forEach(b=>b.onclick=openMatieresModal);
   q("[data-editchap]").forEach(b=>b.onclick=()=>openChapModal(b.dataset.editchap));
   q("[data-delchap]").forEach(b=>b.onclick=()=>delChapitre(b.dataset.delchap));
