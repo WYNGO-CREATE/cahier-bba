@@ -2796,79 +2796,158 @@ async function entrainerChapitre(cid){
    du thème disent le FOND. On croise les deux, au lieu de produire une fiche
    de révision générique qui ne ressemble à aucun sujet réel.
    ========================================================= */
-function annalesDe(mid, maxChars){
-  // Les sujets passés, toutes années confondues : c'est le gabarit de l'épreuve.
-  const an = itemsOfMat(mid).filter(i => i.type === "annale");
-  if(!an.length) return { texte:"", nb:0 };
+/* Pertinence d'un document face à la description que l'étudiant fait de son
+   épreuve. Recherche locale, sans appel au modèle : instantanée, et surtout
+   reproductible — deux lancements identiques donnent la même sélection. */
+function motsUtiles(txt){
+  const vides = new Set(("le la les de des du un une et ou a à au aux en dans sur pour par avec sans "
+    + "ce cet cette ces son sa ses est sont être avoir que qui quoi dont où il elle on nous vous ils "
+    + "elles se sa mes mon ma tes ton ta plus moins tout tous toute toutes chapitre partie cours "
+    + "seance séance exercice examen sujet the of and to in for on a an is are").split(" "));
+  return [...new Set(String(txt||"").toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g,"")
+    .split(/[^a-z0-9]+/)
+    .filter(m=>m.length>2 && !vides.has(m)))];
+}
+
+function scorePertinence(it, mots, titresThemes){
+  if(!mots.length) return 1;
+  const titre = (it.titre||"").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"");
+  const corps = (it.contenu||"").slice(0,6000).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"");
+  const theme = (titresThemes[it.chapitreId]||"").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g,"");
+  let s = 0;
+  for(const m of mots){
+    if(titre.indexOf(m) >= 0) s += 6;      // le titre est le signal le plus sûr
+    if(theme.indexOf(m) >= 0) s += 4;
+    if(corps.indexOf(m) >= 0) s += 1;
+  }
+  return s;
+}
+
+/* Les annales donnent la FORME de l'épreuve : structure, type de questions,
+   barème. On les rassemble à part du contenu, et on privilégie celles qui
+   parlent du sujet annoncé. */
+function annalesDe(mid, mots, titresThemes, maxChars){
+  let an = state.items.filter(i => i.type === "annale" && (!mid || i.matiereId === mid));
+  if(!an.length) return { texte:"", nb:0, titres:[] };
+  an = an.map(i=>({ i, s: scorePertinence(i, mots, titresThemes) }))
+         .sort((a,b)=>b.s-a.s).slice(0,8).map(x=>x.i);
   const budget = maxChars || 16000;
-  const part = Math.max(900, Math.floor(budget / Math.min(an.length, 8)));
+  const part = Math.max(900, Math.floor(budget / an.length));
   let txt = "";
-  an.slice(0, 8).forEach(i=>{
+  an.forEach(i=>{
     const c = String(i.contenu || "");
     txt += "\n=== SUJET : " + (i.titre || "sans titre") + " ===\n"
         + (c.length > part ? c.slice(0, part) + "\n[…]" : c) + "\n";
   });
-  return { texte: txt.slice(0, budget + 400), nb: an.length };
+  return { texte: txt.slice(0, budget + 400), nb: an.length, titres: an.map(i=>i.titre) };
 }
 
 function openEvaluation(mid, cidPre){
   if(!state.matieres.length){ openMatieresModal(); return; }
   mid = mid || state.selMat || state.matieres[0].id;
 
-  const optMat = () => state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===mid?" selected":"")+">"+esc(m.nom)+"</option>").join("");
-  const optChap = (mm, sel) => '<option value="">Toute la matière</option>'
-    + chapsOf(mm).map(c=>'<option value="'+c.id+'"'+(c.id===sel?" selected":"")+">"+esc(c.titre)+"</option>").join("");
+  const optMat = () => '<option value="">Toutes les matières</option>'
+    + state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===mid?" selected":"")+">"+esc(m.nom)+"</option>").join("");
+  const listeThemes = (mm, sel) => {
+    const cs = mm ? chapsOf(mm) : state.chapitres.slice().sort((a,b)=>String(a.titre).localeCompare(String(b.titre)));
+    if(!cs.length) return '<p class="note">Aucun thème dans cette matière — l\'agent cherchera dans tous les documents.</p>';
+    return '<div class="seg" style="flex-direction:column;align-items:stretch;gap:4px;max-height:190px;overflow:auto">'
+      + cs.map(c=>'<label class="prop" style="padding:8px 10px;margin:0;cursor:pointer">'
+          + '<input type="checkbox" data-th="'+c.id+'"'+(c.id===sel?" checked":"")+'>'
+          + '<span><b style="font-size:14px">'+esc(c.titre)+"</b></span></label>").join("")
+      + "</div>";
+  };
 
   modal('<div class="modal-head"><h2>Préparer une épreuve</h2><button class="btn fantome sm" data-x>Fermer</button></div>'
     + '<div class="modal-body"><div class="stack">'
-    + '<p class="note">L\'agent lit les <b>annales</b> de la matière pour en déduire la forme réelle de l\'épreuve, '
-    + "puis s'appuie sur tes documents du thème pour le contenu. Tu obtiens le format attendu, ce qui revient le plus "
-    + "souvent, une fiche ciblée et un sujet blanc inédit avec son corrigé.</p>"
+    + '<div><label class="lab" for="evSujet">Sur quoi porte l\'épreuve ?</label>'
+    +   '<textarea class="field" id="evSujet" rows="3" placeholder="Recopie ce que le prof a annoncé : les notions, les chapitres, ce qui tombe. Plus tu es précis, mieux l\'agent cible."></textarea>'
+    +   '<p class="note" style="margin-top:6px">L\'agent cherche dans <b>tous</b> tes documents ceux qui s\'en rapprochent — '
+    +   "cours, exercices, fiches et annales — puis s'appuie dessus. Tu peux en plus cocher des thèmes ci-dessous pour le restreindre.</p></div>"
     + '<div class="grid2">'
     +   '<div><label class="lab" for="evM">Matière</label><select class="field" id="evM">'+optMat()+"</select></div>"
-    +   '<div><label class="lab" for="evC">Thème</label><select class="field" id="evC">'+optChap(mid, cidPre)+"</select></div>"
+    +   '<div><label class="lab" for="evT">Type d\'épreuve</label><select class="field" id="evT">'
+    +     '<option value="auto">Déduire des annales</option><option value="midterm">Partiel / mi-parcours</option>'
+    +     '<option value="final">Examen final</option><option value="oral">Oral</option><option value="qcm">QCM</option>'
+    +   "</select></div>"
     + "</div>"
-    + '<div><label class="lab" for="evT">Type d\'épreuve</label><select class="field" id="evT">'
-    +   '<option value="auto">Déduire des annales</option>'
-    +   '<option value="midterm">Partiel / mi-parcours</option>'
-    +   '<option value="final">Examen final</option>'
-    +   '<option value="oral">Oral</option>'
-    +   '<option value="qcm">QCM</option>'
-    + "</select></div>"
-    + '<div><label class="lab" for="evD">Dans combien de temps ? (facultatif)</label>'
-    +   '<input class="field" id="evD" placeholder="ex. 3 jours, la semaine prochaine"></div>'
+    + '<div><label class="lab">Thèmes à couvrir (facultatif)</label><div id="evThemes">'+listeThemes(mid, cidPre)+"</div></div>"
+    + '<div><label class="lab" for="evD">Échéance (facultatif)</label>'
+    +   '<input class="field" id="evD" placeholder="ex. jeudi prochain, dans 3 jours"></div>'
     + '<div id="evEtat"></div>'
     + "</div></div>"
     + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Annuler</button>'
     + '<button class="btn pri" id="evGo">Préparer</button></div>', {wide:true, sticky:true});
 
   document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
-  $("#evM").onchange = ()=>{ $("#evC").innerHTML = optChap($("#evM").value, ""); };
-  $("#evGo").onclick = ()=> preparerEvaluation($("#evM").value, $("#evC").value,
-      { type: $("#evT").value, delai: $("#evD").value.trim() });
+  $("#evSujet").focus();
+  $("#evM").onchange = ()=>{ $("#evThemes").innerHTML = listeThemes($("#evM").value, ""); };
+  $("#evGo").onclick = ()=>{
+    const themes = [...document.querySelectorAll("#evThemes [data-th]")].filter(b=>b.checked).map(b=>b.dataset.th);
+    preparerEvaluation($("#evM").value, themes, {
+      sujet: $("#evSujet").value.trim(), type: $("#evT").value, delai: $("#evD").value.trim() });
+  };
 }
 
-async function preparerEvaluation(mid, cid, opt){
-  opt = opt || {};
+async function preparerEvaluation(mid, themes, opt){
+  opt = opt || {}; themes = themes || [];
   if(IA.mode === "off"){ toast("L'agent IA n'est pas configuré — voir Réglages."); return; }
-  const m = matById(mid); if(!m) return;
-  const c = cid ? chapById(cid) : null;
+  if(!opt.sujet && !themes.length){
+    toast("Dis au moins sur quoi porte l'épreuve, ou coche un thème.", 4000); return;
+  }
+  const m = mid ? matById(mid) : null;
 
-  const btn = $("#evGo"); if(btn) btn.disabled = true;
-  // Le panneau doit exister avant le chantier : son compteur ne peint que sur
-  // une cible encore attachée au document.
   closeModal();
   showPanel(); state.tab = "analyse";
-  $("#panelBody").innerHTML = '<div class="card"><div id="evEtat2"></div>'
+  const corps = $("#panelBody");
+  if(!corps) return;
+  corps.innerHTML = '<div class="card"><div id="evEtat2"></div>'
+    + '<div id="evSel" style="margin-top:8px"></div>'
     + '<div class="prose" id="liveOut" style="margin-top:10px"></div></div>';
-  const ch = chantier($("#evEtat2"), "Lecture des annales et des cours", { delai: 300000 });
+  const ch = chantier($("#evEtat2"), "Recherche dans tes documents", { delai: 300000 });
 
-  const an = annalesDe(mid);
-  // Sans thème choisi, on prend un aperçu de toute la matière plutôt que rien.
-  const fond = c ? ctxChapitre(c, 20000)
-    : itemsOfMat(mid).filter(i=>i.type!=="annale").slice(0,25)
-        .map(i=>"--- " + (TYPES[i.type]||i.type) + " : " + (i.titre||"") + " ---\n"
-                + String(i.contenu||"").slice(0,900)).join("\n\n").slice(0,20000);
+  const titresThemes = {};
+  state.chapitres.forEach(c=>{ titresThemes[c.id] = c.titre; });
+  const mots = motsUtiles(opt.sujet + " " + themes.map(t=>titresThemes[t]||"").join(" "));
+
+  // Sélection : d'abord les thèmes cochés, sinon toute la matière, classés par
+  // pertinence face à ce que l'étudiant a décrit.
+  let candidats = state.items.filter(i=>{
+    if(i.type === "annale") return false;
+    if(themes.length) return themes.indexOf(i.chapitreId) >= 0;
+    return !mid || i.matiereId === mid;
+  });
+  candidats = candidats.map(i=>({ i, s: scorePertinence(i, mots, titresThemes) }))
+                       .sort((a,b)=>b.s - a.s || String(a.i.titre).localeCompare(String(b.i.titre)));
+  const retenus = [];
+  let budget = 26000;
+  // Un thème coché rend ses documents pertinents par construction : on les garde
+  // quel que soit leur score. Sur une recherche par description seule, en
+  // revanche, un document qui ne répond à aucun mot n'a rien à faire là — sauf
+  // à n'en avoir trouvé aucun, où mieux vaut trois documents faibles que rien.
+  const filtrerParScore = mots.length > 0 && themes.length === 0;
+  for(const { i, s } of candidats){
+    if(budget <= 0 || retenus.length >= 22) break;
+    if(filtrerParScore && s === 0 && retenus.length >= 3) break;
+    const part = Math.min(2400, Math.max(700, Math.floor(budget / 8)));
+    const c = String(i.contenu||"");
+    retenus.push({ it:i, extrait: c.length > part ? c.slice(0, part) + "\n[…]" : c, s });
+    budget -= Math.min(c.length, part);
+  }
+  const an = annalesDe(mid, mots, titresThemes);
+
+  // On montre ce qui a été retenu : l'étudiant doit pouvoir juger la sélection.
+  const sel = $("#evSel");
+  if(sel) sel.innerHTML = '<p class="note"><b>' + retenus.length + " document(s)</b> retenus"
+    + (an.nb ? " et <b>" + an.nb + "</b> annale(s)" : ", aucune annale trouvée")
+    + " :</p><div class=\"chap-meta\" style=\"margin-top:6px\">"
+    + retenus.slice(0,14).map(r=>'<span class="pill type">'+esc(r.it.titre.slice(0,42))+"</span>").join("")
+    + (retenus.length>14 ? '<span class="pill type">+'+(retenus.length-14)+"</span>" : "") + "</div>";
+
+  const fond = retenus.map(r=>"--- " + (TYPES[r.it.type]||r.it.type) + " · "
+      + (titresThemes[r.it.chapitreId] || "sans thème") + " : " + (r.it.titre||"") + " ---\n" + r.extrait
+    ).join("\n\n");
 
   const nomEpreuve = { auto:"", midterm:"un partiel de mi-parcours", final:"un examen final",
                        oral:"un oral", qcm:"un QCM" }[opt.type] || "";
@@ -2878,50 +2957,57 @@ async function preparerEvaluation(mid, cid, opt){
       system: NIVEAU + "\n\nTu prépares un étudiant à une épreuve précise. Tu ne fais pas de révision "
         + "générique : tu pars de la forme réelle des sujets déjà tombés et du contenu réellement enseigné.",
       messages:[{ role:"user", content:
-        "MATIÈRE : " + m.nom + "\n"
-        + "THÈME VISÉ : " + (c ? c.titre : "toute la matière") + "\n"
+        "MATIÈRE : " + (m ? m.nom : "toutes matières confondues") + "\n"
+        + (opt.sujet ? "CE QUE L'ÉTUDIANT SAIT DE L'ÉPREUVE — c'est la consigne à suivre :\n« " + opt.sujet + " »\n" : "")
+        + (themes.length ? "THÈMES CIBLÉS : " + themes.map(t=>titresThemes[t]||"?").join(" · ") + "\n" : "")
         + (nomEpreuve ? "TYPE D'ÉPREUVE : " + nomEpreuve + "\n" : "")
         + (opt.delai ? "ÉCHÉANCE : " + opt.delai + "\n" : "")
         + "\n" + (an.nb
-            ? "ANNALES DE LA MATIÈRE (" + an.nb + " sujet(s) retrouvé(s) dans le cahier) — "
-              + "c'est de LÀ que tu déduis la forme de l'épreuve :\n" + an.texte + "\n"
+            ? "ANNALES (" + an.nb + " sujet(s) du cahier) — c'est de LÀ que tu déduis la FORME de l'épreuve :\n" + an.texte + "\n"
             : "AUCUNE ANNALE dans le cahier pour cette matière : dis-le explicitement en tête de ta réponse, "
-              + "et propose une forme d'épreuve plausible en la présentant comme une hypothèse.\n")
-        + "\nDOCUMENTS DU THÈME — c'est de LÀ que vient le contenu :\n" + fond + "\n\n"
+              + "et présente la forme que tu proposes comme une hypothèse.\n")
+        + "\nDOCUMENTS RETENUS (" + retenus.length + ") — c'est de LÀ que vient le CONTENU :\n" + fond + "\n\n"
         + "Rédige une préparation en markdown, structurée ainsi :\n"
-        + "## Ce qui t'attend\n"
-        + "La forme de l'épreuve telle que les annales la révèlent : structure, nombre et type de questions, "
-        + "durée et barème si le sujet les indique, place du calcul face à la rédaction. Cite les sujets sur "
-        + "lesquels tu t'appuies. Si les annales divergent entre elles, dis-le.\n"
-        + "## Ce qui revient le plus souvent\n"
-        + "Les notions présentes dans plusieurs sujets, classées de la plus à la moins récurrente. "
-        + "Pour chacune, précise sous quelle forme elle est interrogée.\n"
-        + "## Fiche ciblée\n"
-        + "Uniquement ce qui sert pour cette épreuve : définitions exactes, formules, méthodes pas à pas. "
-        + "Reprends les notations des documents. Pas de digression.\n"
-        + "## Sujet blanc\n"
-        + "Un sujet inédit, calqué sur la forme des annales, avec le barème. N'y recopie aucun exercice existant.\n"
-        + "## Corrigé du sujet blanc\n"
-        + "La correction détaillée, étape par étape.\n"
-        + "## Pièges et erreurs fréquentes\n"
-        + "Ce sur quoi les étudiants se trompent, d'après les corrigés présents dans les annales.\n\n"
-        + "Formules en LaTeX entre $…$, tableaux en markdown. Vérifie tes calculs avant d'écrire le corrigé. "
-        + "N'invente jamais une notion absente des documents fournis." }],
+        + "## Ce qui t'attend\nLa forme de l'épreuve telle que les annales la révèlent : structure, nombre et "
+        + "type de questions, durée et barème s'ils figurent, part du calcul face à la rédaction. Cite les sujets "
+        + "sur lesquels tu t'appuies. Si les annales divergent, dis-le.\n"
+        + "## Ce qui revient le plus souvent\nLes notions présentes dans plusieurs sujets, de la plus à la moins "
+        + "récurrente, avec la forme sous laquelle elles sont interrogées.\n"
+        + "## Fiche ciblée\nUniquement ce qui sert pour CETTE épreuve, au vu de ce que l'étudiant a décrit : "
+        + "définitions exactes, formules, méthodes pas à pas, dans les notations des documents.\n"
+        + "## Sujet blanc\nUn sujet inédit calqué sur la forme des annales, avec son barème. Ne recopie aucun "
+        + "exercice existant.\n"
+        + "## Corrigé du sujet blanc\nLa correction détaillée, étape par étape.\n"
+        + "## Pièges et erreurs fréquentes\nD'après les corrigés présents dans les annales.\n"
+        + "## Ce qui te manque\nSi la description de l'épreuve mentionne une notion absente des documents "
+        + "fournis, dis-le franchement au lieu de l'inventer.\n\n"
+        + "Formules en LaTeX entre $…$, tableaux en markdown. Vérifie tes calculs avant d'écrire le corrigé." }],
       effort:"high", maxTokens: 20000, signal: ch.signal,
       onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
     });
 
-    const it = { id:uid(), matiereId:mid, chapitreId: cid || (chapsOf(mid)[0]||{}).id || null,
-      type:"evaluation", titre:"Préparation — " + (c ? c.titre : m.nom),
+    const chapCible = themes[0] || (retenus[0] && retenus[0].it.chapitreId) || null;
+    const it = { id:uid(), matiereId: mid || (retenus[0] && retenus[0].it.matiereId) || null,
+      chapitreId: chapCible, type:"evaluation",
+      titre:"Préparation — " + (opt.sujet ? opt.sujet.slice(0,60) : (m ? m.nom : "épreuve")),
       contenu: texte, source:"ia", ancre: an.nb>0, date:new Date().toISOString() };
     ch.fini();
     state.items.push(it); await saveItem(it);
     state.openDocs.add(it.id);
-    if(it.chapitreId) aller("chapitre", { chap: it.chapitreId, mat: mid });
-    else aller("matiere", { mat: mid });
-    toast(an.nb ? "Préparation créée à partir de " + an.nb + " annale(s)"
-                : "Préparation créée — aucune annale trouvée dans cette matière");
-  }catch(e){ ch.fini(); iaError(e); renderPanel(); }
+    if(chapCible) aller("chapitre", { chap: chapCible, mat: it.matiereId });
+    else if(it.matiereId) aller("matiere", { mat: it.matiereId });
+    toast(an.nb ? "Préparation créée à partir de " + an.nb + " annale(s) et " + retenus.length + " document(s)"
+                : "Préparation créée — aucune annale trouvée");
+  }catch(e){
+    ch.fini();
+    // L'erreur reste affichée dans le panneau : la remplacer par l'écran d'accueil
+    // faisait disparaître la cause en même temps que le message.
+    const el = $("#evEtat2");
+    if(el) el.innerHTML = '<b style="color:var(--alerte)">' + esc(msgErreur(e)) + "</b>"
+      + '<p class="note" style="margin-top:8px">Rien n\'a été enregistré. Tu peux relancer, '
+      + "ou réduire le nombre de thèmes cochés si le service a manqué de souffle.</p>";
+    else iaError(e);
+  }
 }
 
 /* =========================================================
