@@ -555,6 +555,101 @@ function idbLire(cle){
   }));
 }
 
+/* =========================================================
+   FILET DE SÉCURITÉ
+   Un classeur de cours ne doit jamais perdre une ligne écrite à la main.
+   Avant toute opération destructrice — suppression d'une matière, d'un
+   chapitre, d'un document, ou import massif — on prend un instantané
+   complet. Dix sont conservés, dans IndexedDB, indépendants du contenu
+   courant : même une suppression totale reste réversible.
+   ========================================================= */
+const MAX_INSTANTANES = 10;
+
+async function instantane(motif){
+  try{
+    const liste = (await idbLire("sauvegardes")) || [];
+    liste.unshift({
+      date: new Date().toISOString(), motif: motif || "automatique",
+      matieres: state.matieres, chapitres: state.chapitres, items: state.items,
+      compte: { m: state.matieres.length, c: state.chapitres.length, d: state.items.length }
+    });
+    await idbEcrire("sauvegardes", liste.slice(0, MAX_INSTANTANES));
+    return true;
+  }catch(e){ return false; }
+}
+
+/* Ratisse tous les emplacements de stockage connus, y compris ceux qu'une
+   version précédente de l'outil utilisait. Sert quand du contenu a disparu. */
+async function fouillerStockages(){
+  const trouvailles = [];
+  try{
+    const c = await idbLire("contenu");
+    if(c && (c.items||[]).length) trouvailles.push({ ou:"IndexedDB — contenu courant", d:c });
+  }catch(e){}
+  try{
+    const l = (await idbLire("sauvegardes")) || [];
+    l.forEach((s,n)=>trouvailles.push({ ou:"Instantané du " + new Date(s.date).toLocaleString("fr-FR") + " (" + s.motif + ")", d:s, snap:n }));
+  }catch(e){}
+  for(const k of [LS_KEY, "cahier-bba", "cahier-bba-v1"]){
+    try{
+      const brut = localStorage.getItem(k);
+      if(!brut) continue;
+      const d = JSON.parse(brut);
+      if(d && (d.items||[]).length) trouvailles.push({ ou:"Ancien stockage « "+k+" »", d });
+    }catch(e){}
+  }
+  return trouvailles;
+}
+
+async function ecranRecuperation(){
+  modal('<div class="modal-head"><h2>Récupérer du contenu perdu</h2>'
+    + '<button class="btn fantome sm" data-x>Fermer</button></div>'
+    + '<div class="modal-body"><div id="recOut"><span class="thinking"><i></i>Fouille de tous les stockages…</span></div></div>'
+    + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Fermer</button></div>', {wide:true, sticky:true});
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+
+  const t = await fouillerStockages();
+  const out = $("#recOut");
+  if(!out) return;
+  if(!t.length){
+    out.innerHTML = '<div class="card"><p class="note">Aucune sauvegarde trouvée sur cet appareil. '
+      + "Si tu as exporté un JSON, passe par « Importer un JSON » dans les réglages.</p></div>";
+    return;
+  }
+  out.innerHTML = '<p class="note">Chaque entrée est un état complet retrouvé sur cet appareil. '
+    + "Restaurer <b>fusionne</b> son contenu avec ton cahier actuel : rien n'est écrasé, "
+    + "les documents déjà présents sont ignorés.</p>"
+    + t.map((x,n)=>{
+        const d = x.d, nb = (d.items||[]).length;
+        const parMat = {};
+        (d.items||[]).forEach(i=>{
+          const m = (d.matieres||[]).find(y=>y.id===i.matiereId);
+          const nom = m ? m.nom : "(matière supprimée)";
+          parMat[nom] = (parMat[nom]||0) + 1;
+        });
+        return '<div class="card"><h4>'+esc(x.ou)+"</h4>"
+          + '<p class="note"><b>'+nb+" document(s)</b> · "+(d.matieres||[]).length+" matière(s) · "
+          + (d.chapitres||[]).length+" thème(s)</p>"
+          + '<div class="chap-meta" style="margin-top:6px">'
+          + Object.keys(parMat).sort().map(k=>'<span class="pill type">'+esc(k)+" · "+parMat[k]+"</span>").join("")
+          + "</div>"
+          + '<div class="doc-actions"><button class="btn pri sm" data-rest="'+n+'">Restaurer ces '+nb+" document(s)</button></div></div>";
+      }).join("");
+
+  out.querySelectorAll("[data-rest]").forEach(b=>b.onclick=async ()=>{
+    const x = t[Number(b.dataset.rest)], d = x.d;
+    await instantane("avant restauration");
+    const aId = (arr,id)=>arr.some(y=>y.id===id);
+    let nm=0, nc=0, nd=0;
+    (d.matieres||[]).forEach(m=>{ if(!aId(state.matieres,m.id)){ state.matieres.push(m); nm++; } });
+    (d.chapitres||[]).forEach(c=>{ if(!aId(state.chapitres,c.id)){ state.chapitres.push(c); nc++; } });
+    for(const i of (d.items||[])) if(!aId(state.items,i.id)){ state.items.push(i); await saveItem(i); nd++; }
+    await saveStructure();
+    closeModal(); render();
+    toast("Restauré : "+nd+" document(s), "+nc+" thème(s), "+nm+" matière(s).", 6000);
+  });
+}
+
 let quotaSignale = false;
 function localSave(){
   const paquet = { matieres: state.matieres, chapitres: state.chapitres, items: state.items };
@@ -644,8 +739,26 @@ const matById  = id => state.matieres.find(m=>m.id===id);
 const chapById = id => state.chapitres.find(c=>c.id===id);
 const chapsOf  = mid => state.chapitres.filter(c=>c.matiereId===mid)
                         .sort((a,b)=>(a.numero||0)-(b.numero||0) || String(a.titre).localeCompare(String(b.titre)));
+/* Un cours suit l'ordre de la matière, pas celui où les fichiers ont été
+   déposés. « ordre » est fixé par l'étudiant et l'emporte ; à défaut on
+   retombe sur la date d'ajout. */
+const rang = i => (i.ordre === undefined || i.ordre === null) ? 1e9 : Number(i.ordre);
 const itemsOf  = cid => state.items.filter(i=>i.chapitreId===cid)
-                        .sort((a,b)=>String(a.date||"").localeCompare(String(b.date||"")));
+                        .sort((a,b)=> rang(a) - rang(b)
+                              || String(a.date||"").localeCompare(String(b.date||"")));
+
+/* Renumérote un thème d'après l'ordre affiché, puis enregistre. */
+async function reordonner(cid, id, sens){
+  const l = itemsOf(cid);
+  const i = l.findIndex(x=>x.id===id);
+  const j = i + sens;
+  if(i < 0 || j < 0 || j >= l.length) return;
+  l.splice(j, 0, l.splice(i, 1)[0]);
+  for(let n = 0; n < l.length; n++){
+    if(l[n].ordre !== n){ l[n].ordre = n; await saveItem(l[n]); }
+  }
+  render();
+}
 const itemsOfMat = mid => state.items.filter(i=>i.matiereId===mid);
 
 /* =========================================================
@@ -1794,7 +1907,21 @@ function openMatieresModal(){
                   : { id:uid(), nom, code:code||"", prof:prof||"", couleur:COULEURS[(anciens.length+idx)%COULEURS.length], ordre:idx };
     });
     const supprimes = anciens.filter(a=>!next.some(n=>n.id===a.id));
-    if(supprimes.length && !confirm("Supprimer "+supprimes.length+" matière(s) et tous leurs chapitres et documents ?")) return;
+    if(supprimes.length){
+      // Dire exactement ce qui va être détruit. L'ancienne formulation ne
+      // chiffrait rien : on pouvait effacer des cours écrits à la main en
+      // croyant supprimer une matière vide.
+      const detail = supprimes.map(x=>{
+        const nd = itemsOfMat(x.id).length, nc = chapsOf(x.id).length;
+        return "• " + x.nom + " — " + nd + " document" + (nd>1?"s":"") + ", " + nc + " thème" + (nc>1?"s":"");
+      }).join("\n");
+      const total = supprimes.reduce((n,x)=>n+itemsOfMat(x.id).length, 0);
+      if(!confirm("SUPPRESSION DÉFINITIVE\n\n" + detail
+        + "\n\nSoit " + total + " document" + (total>1?"s":"") + " au total."
+        + (total ? "\n\nUne sauvegarde est conservée : Réglages → Récupérer du contenu." : "")
+        + "\n\nConfirmer ?")) return;
+      await instantane("avant suppression de " + supprimes.map(x=>x.nom).join(", "));
+    }
     for(const s of supprimes){
       for(const it of itemsOfMat(s.id)) await deleteItem(it.id);
       state.chapitres = state.chapitres.filter(c=>c.matiereId!==s.id);
@@ -1840,7 +1967,9 @@ function openChapModal(cid){
 async function delChapitre(cid){
   const c = chapById(cid); if(!c) return;
   const n = itemsOf(cid).length;
-  if(!confirm("Supprimer « "+c.titre+" »"+(n?" et ses "+n+" document(s)":"")+" ?")) return;
+  if(!confirm("Supprimer « "+c.titre+" »"+(n?" et ses "+n+" document(s)":"")+" ?"
+    + (n?"\n\nUne sauvegarde est conservée : Réglages → Récupérer du contenu.":""))) return;
+  if(n) await instantane("avant suppression du thème " + c.titre);
   for(const it of itemsOf(cid)) await deleteItem(it.id);
   state.chapitres = state.chapitres.filter(x=>x.id!==cid);
   state.openChaps.delete(cid); if(state.selChap===cid) state.selChap = null;
@@ -3965,6 +4094,8 @@ function vueChapitre(){
                     +   (i.maj && i.maj !== i.date ? " · modifié le " + esc(dateHeure(i.maj)) : "")
                     + "</p>"
                     + '<div class="doc-actions">'
+                    +   '<button class="btn sm" data-monter="'+i.id+'" title="Remonter dans le thème">↑</button>'
+                    +   '<button class="btn sm" data-descendre="'+i.id+'" title="Descendre dans le thème">↓</button>'
                     +   '<button class="btn sm" data-edit="'+i.id+'">Modifier</button>'
                     +   '<button class="btn sm" data-deplacer="'+i.id+'">Déplacer</button>'
                     +   '<button class="btn sm" data-expliquer="'+i.id+'">Expliquer</button>'
@@ -4118,6 +4249,10 @@ function vueReglages(){
     +   '<div class="seg" style="margin-top:10px" id="rTheme">'
     +     ['auto','light','dark'].map(t=>'<button data-theme="'+t+'">'+({auto:"Système",light:"Clair",dark:"Sombre"})[t]+"</button>").join("")
     +   "</div></div>"
+    + '<div class="card"><h4>Récupérer du contenu</h4>'
+    +   '<p class="note">Le cahier garde les dix derniers états complets, pris avant chaque suppression '
+    +   "et chaque import. Si quelque chose a disparu, c'est ici qu'on le retrouve.</p>"
+    +   '<div class="doc-actions"><button class="btn pri sm" id="rRecup">Chercher du contenu perdu</button></div></div>'
     + '<div class="card"><h4>Stockage</h4>'
     +   '<p class="note" id="rStock">Mesure en cours…</p>'
     +   '<div class="doc-actions"><button class="btn sm" id="rPurge">Libérer la place inutilisée</button></div></div>'
@@ -4130,6 +4265,8 @@ function vueReglages(){
     + "</div>";
 
   $("#rIA").onclick = openSettings;
+  const bRecup = $("#rRecup");
+  if(bRecup) bRecup.onclick = ecranRecuperation;
 
   // Le stockage saturé est invisible tant qu'on ne le mesure pas : c'est lui
   // qui empêchait la clé API de s'enregistrer.
@@ -4232,6 +4369,7 @@ function importerJSON(){
     try{
       const d = JSON.parse(await f.text());
       if(!confirm("Fusionner ce fichier avec ton cahier actuel ?")) return;
+      await instantane("avant import d'un JSON");
       const a = (arr,id)=>arr.some(x=>x.id===id);
       (d.matieres||[]).forEach(m=>{ if(!a(state.matieres,m.id)) state.matieres.push(m); });
       (d.chapitres||[]).forEach(c=>{ if(!a(state.chapitres,c.id)) state.chapitres.push(c); });
@@ -4283,11 +4421,21 @@ function câbler(scene){
   q("[data-editchap]").forEach(b=>b.onclick=()=>openChapModal(b.dataset.editchap));
   q("[data-delchap]").forEach(b=>b.onclick=()=>delChapitre(b.dataset.delchap));
   q("[data-edit]").forEach(b=>b.onclick=()=>openEditor({itemId:b.dataset.edit}));
+  q("[data-monter]").forEach(b=>b.onclick=()=>{
+    const it = state.items.find(x=>x.id===b.dataset.monter);
+    if(it) reordonner(it.chapitreId, it.id, -1);
+  });
+  q("[data-descendre]").forEach(b=>b.onclick=()=>{
+    const it = state.items.find(x=>x.id===b.dataset.descendre);
+    if(it) reordonner(it.chapitreId, it.id, +1);
+  });
   q("[data-expliquer]").forEach(b=>b.onclick=()=>expliquer(b.dataset.expliquer));
   q("[data-fiche]").forEach(b=>b.onclick=()=>genererFiche(b.dataset.fiche));
   q("[data-del]").forEach(b=>b.onclick=async()=>{
     const it = state.items.find(x=>x.id===b.dataset.del);
-    if(!it || !confirm("Supprimer « "+(it.titre||"ce document")+" » ?")) return;
+    if(!it || !confirm("Supprimer « "+(it.titre||"ce document")+" » ?"
+      + "\n\nUne sauvegarde est conservée : Réglages → Récupérer du contenu.")) return;
+    await instantane("avant suppression de " + (it.titre||"un document"));
     await deleteItem(b.dataset.del); render(); toast("Document supprimé");
   });
   q("[data-analyse]").forEach(b=>b.onclick=()=>{ state.tab="analyse"; analyseChapitre(b.dataset.analyse); });
