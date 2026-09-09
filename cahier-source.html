@@ -776,7 +776,14 @@ function enregistrerConfig({ fournisseur, cle, modele }){
     if(fournisseur && FOURNISSEURS[fournisseur]){
       IA.fournisseur = fournisseur;
       localStorage.setItem(S_FOURN, fournisseur);
-      if(modele === undefined){ IA.modele = FOURNISSEURS[fournisseur].modeleDefaut; localStorage.setItem(S_MODELE, IA.modele); }
+      // On n'impose le modèle par défaut que s'il n'y en a aucun d'enregistré :
+      // écraser un modèle déjà validé par une valeur codée en dur relançait
+      // toute la recherche, et le nom figé finit toujours par disparaître du
+      // catalogue du fournisseur.
+      if(modele === undefined && !localStorage.getItem(S_MODELE)){
+        IA.modele = FOURNISSEURS[fournisseur].modeleDefaut;
+        localStorage.setItem(S_MODELE, IA.modele);
+      }
     }
     if(cle !== undefined){
       IA.cles[IA.fournisseur] = (cle||"").trim();
@@ -3434,6 +3441,21 @@ function openSettings(){
       out.innerHTML = '<span class="thinking"><i></i>Vérification de la clé…</span>';
       try{
         const noms = await listerModeles();
+
+        // Un modèle déjà retenu, et que le fournisseur propose toujours, a fait
+        // ses preuves : on le garde. Le re-tester faisait perdre de longues
+        // secondes et pouvait basculer sur un modèle plus récent mais non
+        // éprouvé, simplement parce qu'il venait d'entrer au catalogue.
+        const dejaEnPlace = ($("#sModele").value.trim() || IA.modele || "").trim();
+        if(dejaEnPlace && noms.indexOf(dejaEnPlace) >= 0){
+          enregistrerConfig({ modele: dejaEnPlace });
+          closeModal(); openSettings();
+          const o0 = $("#sKeyOut");
+          if(o0) o0.innerHTML = '<b style="color:var(--ok)">Tout est prêt.</b> Modèle conservé : <b>'
+            + esc(dejaEnPlace) + "</b>. Pour en changer, passe par « Lister ».";
+          return;
+        }
+
         const candidats = classerModeles(noms);
         if(!candidats.length) throw Object.assign(new Error("aucun modèle utilisable"), { code:"modele_inconnu" });
 
