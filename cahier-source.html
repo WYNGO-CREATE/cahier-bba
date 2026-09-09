@@ -510,13 +510,75 @@ function toast(msg, ms){
   setTimeout(()=>t.remove(), ms || 2600);
 }
 
-/* ---------- lecture / écriture ---------- */
+/* ---------- lecture / écriture ----------
+   Le contenu du cahier vit dans IndexedDB, pas dans localStorage. Raison :
+   localStorage plafonne autour de 5 Mo, et un semestre importé en pèse
+   davantage. Quand il déborde, TOUTES les écritures échouent — y compris
+   celle de la clé API, quelques dizaines d'octets, qui n'a plus de place.
+   localStorage ne garde donc plus que la configuration : clés, préférences.
+   ------------------------------------------------------------------ */
+const IDB_NOM = "cahier-bba", IDB_STORE = "espace";
+let idbPromesse = null;
+function idb(){
+  if(idbPromesse) return idbPromesse;
+  idbPromesse = new Promise((ok, ko)=>{
+    if(typeof indexedDB === "undefined") return ko(new Error("IndexedDB indisponible"));
+    const r = indexedDB.open(IDB_NOM, 1);
+    r.onupgradeneeded = ()=>{ if(!r.result.objectStoreNames.contains(IDB_STORE)) r.result.createObjectStore(IDB_STORE); };
+    r.onsuccess = ()=>ok(r.result);
+    r.onerror   = ()=>ko(r.error || new Error("ouverture refusée"));
+  }).catch(e=>{ idbPromesse = null; throw e; });
+  return idbPromesse;
+}
+function idbEcrire(cle, val){
+  return idb().then(d=>new Promise((ok, ko)=>{
+    const t = d.transaction(IDB_STORE, "readwrite");
+    t.objectStore(IDB_STORE).put(val, cle);
+    t.oncomplete = ()=>ok(true);
+    t.onerror = t.onabort = ()=>ko(t.error || new Error("écriture refusée"));
+  }));
+}
+function idbLire(cle){
+  return idb().then(d=>new Promise((ok, ko)=>{
+    const t = d.transaction(IDB_STORE, "readonly");
+    const q = t.objectStore(IDB_STORE).get(cle);
+    q.onsuccess = ()=>ok(q.result);
+    q.onerror   = ()=>ko(q.error || new Error("lecture refusée"));
+  }));
+}
+
+let quotaSignale = false;
 function localSave(){
+  const paquet = { matieres: state.matieres, chapitres: state.chapitres, items: state.items };
+  idbEcrire("contenu", paquet).catch(e=>{
+    // Repli : seulement si le cahier est assez petit pour y tenir. Sinon on
+    // préfère ne rien écrire plutôt que de saturer la place de la clé API.
+    try{
+      const txt = JSON.stringify(paquet);
+      if(txt.length < 1500000) localStorage.setItem(LS_KEY, txt);
+      else throw new Error("trop volumineux pour le stockage de secours");
+    }catch(e2){
+      if(!quotaSignale){
+        quotaSignale = true;
+        toast("Sauvegarde locale impossible sur cet appareil — exporte ton cahier en JSON pour ne rien perdre.", 6000);
+      }
+    }
+  });
+}
+
+/* Le contenu a longtemps vécu dans localStorage : on le déménage une fois,
+   puis on libère la place — c'est elle qui manquait à la clé API. */
+async function migrerDepuisLocalStorage(){
+  let brut = null;
+  try{ brut = localStorage.getItem(LS_KEY); }catch(e){ return null; }
+  if(!brut) return null;
+  let d = null;
+  try{ d = JSON.parse(brut); }catch(e){ return null; }
   try{
-    localStorage.setItem(LS_KEY, JSON.stringify({
-      matieres: state.matieres, chapitres: state.chapitres, items: state.items
-    }));
-  }catch(e){ /* quota : le db reste la source de vérité */ }
+    await idbEcrire("contenu", { matieres:d.matieres||[], chapitres:d.chapitres||[], items:d.items||[] });
+    localStorage.removeItem(LS_KEY);      // la place ainsi rendue est celle de la configuration
+  }catch(e){ /* IndexedDB refusée : on garde l'ancien emplacement */ }
+  return d;
 }
 
 async function saveStructure(){
@@ -559,13 +621,12 @@ async function loadAll(){
     }catch(e){ loadedRemote = false; }
   }
   if(!loadedRemote){
-    try{
-      const raw = localStorage.getItem(LS_KEY);
-      if(raw){
-        const d = JSON.parse(raw);
-        state.matieres = d.matieres || []; state.chapitres = d.chapitres || []; state.items = d.items || [];
-      }
-    }catch(e){}
+    let d = null;
+    try{ d = await idbLire("contenu"); }catch(e){}
+    if(!d) d = await migrerDepuisLocalStorage();
+    if(d){
+      state.matieres = d.matieres || []; state.chapitres = d.chapitres || []; state.items = d.items || [];
+    }
   }
   state.loaded = true;
 }
@@ -710,6 +771,7 @@ function chargerConfig(){
 }
 
 function enregistrerConfig({ fournisseur, cle, modele }){
+  let echec = null;
   try{
     if(fournisseur && FOURNISSEURS[fournisseur]){
       IA.fournisseur = fournisseur;
@@ -725,8 +787,19 @@ function enregistrerConfig({ fournisseur, cle, modele }){
       IA.modele = modele; localStorage.setItem(S_MODELE, modele);
       reintegrerModele(modele);   // un choix explicite lève une exclusion passée
     }
-  }catch(e){}
+  }catch(e){
+    // Une écriture de configuration qui échoue sans rien dire est pire qu'une
+    // erreur : l'étudiant croit sa clé enregistrée et la retrouve absente au
+    // rechargement suivant. C'était le cas quand le contenu du cahier saturait
+    // localStorage — d'où le déplacement du contenu vers IndexedDB.
+    echec = e;
+    const plein = e && (e.name === "QuotaExceededError" || e.code === 22 || e.code === 1014);
+    toast(plein
+      ? "Stockage du navigateur saturé : la clé n'a pas pu être enregistrée. Va dans Réglages → Stockage pour libérer de la place."
+      : "Enregistrement impossible : " + ((e && e.message) || "stockage refusé par le navigateur"), 6500);
+  }
   majMode();
+  return !echec;
 }
 
 /* La page peut-elle joindre le réseau ? Un artifact publié ne le peut pas. */
@@ -4015,6 +4088,9 @@ function vueReglages(){
     +   '<div class="seg" style="margin-top:10px" id="rTheme">'
     +     ['auto','light','dark'].map(t=>'<button data-theme="'+t+'">'+({auto:"Système",light:"Clair",dark:"Sombre"})[t]+"</button>").join("")
     +   "</div></div>"
+    + '<div class="card"><h4>Stockage</h4>'
+    +   '<p class="note" id="rStock">Mesure en cours…</p>'
+    +   '<div class="doc-actions"><button class="btn sm" id="rPurge">Libérer la place inutilisée</button></div></div>'
     + '<div class="card"><h4>Sauvegarde</h4><p class="note">'
     +   (db ? "Tes cours sont enregistrés sur ton compte et suivent cette page d'un appareil à l'autre."
           : "Sauvegarde locale à ce navigateur. Exporte de temps en temps.")
@@ -4024,6 +4100,42 @@ function vueReglages(){
     + "</div>";
 
   $("#rIA").onclick = openSettings;
+
+  // Le stockage saturé est invisible tant qu'on ne le mesure pas : c'est lui
+  // qui empêchait la clé API de s'enregistrer.
+  (async ()=>{
+    const el = $("#rStock"); if(!el) return;
+    let ls = 0;
+    try{ for(const k in localStorage) if(Object.prototype.hasOwnProperty.call(localStorage,k)) ls += (localStorage[k]||"").length + k.length; }catch(e){}
+    let quota = null, usage = null;
+    try{
+      if(navigator.storage && navigator.storage.estimate){
+        const e = await navigator.storage.estimate(); quota = e.quota; usage = e.usage;
+      }
+    }catch(e){}
+    const ko = n => (n/1024).toFixed(0) + " Ko";
+    const mo = n => (n/1048576).toFixed(1) + " Mo";
+    el.innerHTML =
+        "Cahier : <b>" + mo(JSON.stringify({m:state.matieres,c:state.chapitres,i:state.items}).length*2) + "</b>"
+      + " dans la base du navigateur (IndexedDB), qui n'a pas la limite de 5 Mo de l'ancien emplacement.<br>"
+      + "Configuration (clés, préférences) : <b>" + ko(ls*2) + "</b>"
+      + (ls*2 > 4000000 ? ' — <b style="color:var(--alerte)">saturée</b>, c\'est ce qui empêche d\'enregistrer une clé.' : ".")
+      + (usage != null ? "<br>Espace utilisé par le site : " + mo(usage)
+          + (quota ? " sur " + mo(quota) + " autorisés." : ".") : "");
+  })();
+
+  const bPurge = $("#rPurge");
+  if(bPurge) bPurge.onclick = ()=>{
+    let libere = 0;
+    try{
+      const v = localStorage.getItem(LS_KEY);
+      if(v){ libere = v.length; localStorage.removeItem(LS_KEY); }
+    }catch(e){}
+    localSave();   // réécrit le contenu dans IndexedDB, à sa bonne place
+    toast(libere ? "Ancien emplacement vidé — " + (libere*2/1048576).toFixed(1) + " Mo rendus."
+                 : "Rien à libérer : la configuration est déjà au large.", 4500);
+    setTimeout(vueReglages, 600);
+  };
   $("#rQual").querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{ reglerQualite(b.dataset.q); vueReglages(); });
   $("#rPlaf").querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{ reglerPlafond(Number(b.dataset.p)); vueReglages(); });
   $("#rEpreuve").onclick = async ()=>{
