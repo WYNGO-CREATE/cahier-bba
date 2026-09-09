@@ -555,124 +555,109 @@ function idbLire(cle){
    Aucune bibliothèque : l'API REST de Supabase suffit, et deux appels.
    ========================================================= */
 const S_SUPA = LS_KEY + "-supabase";
-const SUPA = { url:"", cle:"", jeton:"", rafraichir:"", email:"", etat:"éteint" };
+const SUPA = { url:"", cle:"", code:"", etat:"éteint" };
 
 function chargerSupa(){
   try{
     const d = JSON.parse(localStorage.getItem(S_SUPA) || "{}");
-    SUPA.url = d.url || ""; SUPA.cle = d.cle || "";
-    SUPA.jeton = d.jeton || ""; SUPA.rafraichir = d.rafraichir || ""; SUPA.email = d.email || "";
+    SUPA.url = d.url || ""; SUPA.cle = d.cle || ""; SUPA.code = d.code || "";
   }catch(e){}
-  SUPA.etat = !SUPA.url || !SUPA.cle ? "éteint" : (SUPA.jeton ? "connecté" : "déconnecté");
+  // Le lien de partage porte tout : ouvrir ce lien sur un appareil neuf
+  // suffit à retrouver son cahier, sans rien saisir.
+  try{
+    const h = new URLSearchParams(String(location.hash || "").replace(/^#/, ""));
+    if(h.get("u") && h.get("k") && h.get("c")){
+      SUPA.url = h.get("u"); SUPA.cle = h.get("k"); SUPA.code = h.get("c");
+      enregistrerSupa();
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+  }catch(e){}
+  SUPA.etat = supaActif() ? "en ligne" : "éteint";
 }
+
+// Ouvrir son favori alors que le site est déjà affiché ne recharge pas la
+// page : sans cette écoute, le lien serait ignoré et l'étudiant croirait
+// que son cahier a disparu.
+window.addEventListener("hashchange", async ()=>{
+  const avant = SUPA.code;
+  chargerSupa();
+  if(SUPA.code && SUPA.code !== avant){
+    toast("Lien reconnu — récupération du cahier…", 3000);
+    try{
+      const d = await supaLire();
+      if(d && (d.items.length || d.matieres.length)){
+        state.matieres = d.matieres; state.chapitres = d.chapitres; state.items = d.items;
+        localSave(); render();
+        toast(d.items.length + " document(s) retrouvés.", 4000);
+      }
+    }catch(e){ toast("Lien reconnu, mais le serveur n'a pas répondu.", 4000); }
+  }
+});
 function enregistrerSupa(){
-  try{
-    localStorage.setItem(S_SUPA, JSON.stringify({
-      url:SUPA.url, cle:SUPA.cle, jeton:SUPA.jeton, rafraichir:SUPA.rafraichir, email:SUPA.email }));
-  }catch(e){ toast("Impossible d'enregistrer la connexion sur cet appareil.", 5000); }
+  try{ localStorage.setItem(S_SUPA, JSON.stringify({ url:SUPA.url, cle:SUPA.cle, code:SUPA.code })); }
+  catch(e){ toast("Impossible de retenir le lien sur cet appareil.", 5000); }
 }
-const supaActif = () => !!(SUPA.url && SUPA.cle && SUPA.jeton);
+const supaActif = () => !!(SUPA.url && SUPA.cle && SUPA.code);
 
-async function supaAppel(chemin, opts){
-  opts = opts || {};
-  const base = SUPA.url.replace(/\/+$/, "");
-  const entetes = Object.assign({
-    "apikey": SUPA.cle,
-    "Content-Type": "application/json"
-  }, opts.headers || {});
-  if(SUPA.jeton && !opts.sansJeton) entetes["Authorization"] = "Bearer " + SUPA.jeton;
-
-  let r = await fetch(base + chemin, { method: opts.method || "GET", headers: entetes, body: opts.body });
-
-  // Un jeton expire au bout d'une heure : on le renouvelle et on rejoue,
-  // sinon l'étudiant serait déconnecté en pleine session sans comprendre.
-  if(r.status === 401 && SUPA.rafraichir && !opts.dejaRejoue){
-    const ok = await supaRenouveler();
-    if(ok) return supaAppel(chemin, Object.assign({}, opts, { dejaRejoue:true }));
-  }
-  return r;
+function lienCahier(){
+  if(!supaActif()) return "";
+  const p = new URLSearchParams({ u:SUPA.url, k:SUPA.cle, c:SUPA.code });
+  return location.origin + location.pathname + "#" + p.toString();
 }
 
-async function supaRenouveler(){
+function nouveauCode(){
+  const a = new Uint8Array(24);
+  (self.crypto || window.crypto).getRandomValues(a);
+  return [...a].map(x=>("0"+x.toString(16)).slice(-2)).join("");
+}
+
+/* Les deux seuls appels réseau : une fonction pour lire, une pour écrire.
+   Le code secret voyage dans le corps de la requête, jamais dans l'URL. */
+async function supaRPC(fonction, args){
+  // Un serveur injoignable ne doit jamais faire attendre : sans cette borne,
+  // une adresse de projet erronée laissait la page blanche indéfiniment.
+  const ctl = new AbortController();
+  const minuteur = setTimeout(()=>ctl.abort(), 10000);
+  let r;
   try{
-    const r = await fetch(SUPA.url.replace(/\/+$/,"") + "/auth/v1/token?grant_type=refresh_token", {
-      method:"POST", headers:{ "apikey":SUPA.cle, "Content-Type":"application/json" },
-      body: JSON.stringify({ refresh_token: SUPA.rafraichir })
+    r = await fetch(SUPA.url.replace(/\/+$/,"") + "/rest/v1/rpc/" + fonction, {
+      method:"POST", signal: ctl.signal,
+      headers:{ "apikey":SUPA.cle, "Authorization":"Bearer "+SUPA.cle, "Content-Type":"application/json" },
+      body: JSON.stringify(args)
     });
-    if(!r.ok) throw new Error("session expirée");
-    const j = await r.json();
-    SUPA.jeton = j.access_token || ""; SUPA.rafraichir = j.refresh_token || SUPA.rafraichir;
-    enregistrerSupa();
-    return !!SUPA.jeton;
   }catch(e){
-    SUPA.jeton = ""; SUPA.etat = "déconnecté"; enregistrerSupa();
-    return false;
-  }
-}
-
-async function supaConnexion(email, motDePasse, creer){
-  const base = SUPA.url.replace(/\/+$/,"");
-  const chemin = creer ? "/auth/v1/signup" : "/auth/v1/token?grant_type=password";
-  const r = await fetch(base + chemin, {
-    method:"POST", headers:{ "apikey":SUPA.cle, "Content-Type":"application/json" },
-    body: JSON.stringify({ email, password: motDePasse })
-  });
-  const j = await r.json().catch(()=>({}));
+    throw new Error(e && e.name === "AbortError" ? "le serveur n'a pas répondu en 10 secondes"
+                                                 : "serveur injoignable");
+  }finally{ clearTimeout(minuteur); }
   if(!r.ok){
-    const m = j.error_description || j.msg || j.message || ("HTTP " + r.status);
-    throw new Error(m);
+    const t = await r.text().catch(()=>"" );
+    let aide = "";
+    if(r.status === 404) aide = " — le SQL n'a pas été exécuté, ou pas dans ce projet.";
+    else if(r.status === 401 || r.status === 403) aide = " — la clé ne correspond pas à ce projet.";
+    else if(r.status === 405) aide = " — l'adresse du projet semble incorrecte.";
+    throw new Error("HTTP " + r.status + aide + (t ? " " + t.slice(0,140) : ""));
   }
-  if(!j.access_token){
-    // Supabase peut exiger une confirmation par courriel avant d'ouvrir la session.
-    throw Object.assign(new Error("Compte créé. Confirme l'adresse dans le courriel reçu, puis reviens te connecter."),
-      { code:"confirmation" });
-  }
-  SUPA.jeton = j.access_token; SUPA.rafraichir = j.refresh_token || "";
-  SUPA.email = email; SUPA.etat = "connecté";
-  enregistrerSupa();
-  return true;
+  return r.json().catch(()=>null);
 }
 
-function supaDeconnexion(){
-  SUPA.jeton = ""; SUPA.rafraichir = ""; SUPA.etat = "déconnecté";
-  enregistrerSupa();
-}
-
-/* Lecture du cahier en ligne. Renvoie null si rien n'a jamais été enregistré. */
 async function supaLire(){
-  const r = await supaAppel("/rest/v1/cahier?select=contenu,maj");
-  if(!r.ok) throw new Error("lecture refusée (HTTP " + r.status + ")");
-  const l = await r.json();
-  if(!l.length) return null;
-  const c = l[0].contenu || {};
-  return { matieres:c.matieres||[], chapitres:c.chapitres||[], items:c.items||[], maj:l[0].maj };
+  const c = await supaRPC("cahier_lire", { c: SUPA.code });
+  if(!c) return null;
+  return { matieres:c.matieres||[], chapitres:c.chapitres||[], items:c.items||[] };
 }
 
-/* Écriture : une seule ligne par compte, remplacée à chaque fois. */
 let supaEnCours = null, supaAttente = false;
 async function supaEcrire(){
   if(!supaActif()) return false;
   if(supaEnCours){ supaAttente = true; return supaEnCours; }
   supaEnCours = (async ()=>{
     try{
-      const corps = JSON.stringify({
-        contenu: { matieres:state.matieres, chapitres:state.chapitres, items:state.items },
-        maj: new Date().toISOString()
-      });
-      const r = await supaAppel("/rest/v1/cahier", {
-        method:"POST", body: corps,
-        headers:{ "Prefer":"resolution=merge-duplicates,return=minimal" }
-      });
-      if(!r.ok){
-        const t = await r.text().catch(()=>"" );
-        throw new Error("HTTP " + r.status + (t ? " — " + t.slice(0,160) : ""));
-      }
-      SUPA.etat = "connecté";
-      majBandeau();
+      await supaRPC("cahier_ecrire", { c: SUPA.code,
+        j: { matieres:state.matieres, chapitres:state.chapitres, items:state.items } });
+      SUPA.etat = "en ligne"; majBandeau();
       return true;
     }catch(e){
-      SUPA.etat = "hors ligne";
-      majBandeau(e && e.message);
+      SUPA.etat = "hors ligne"; majBandeau(e && e.message);
       return false;
     }finally{
       supaEnCours = null;
@@ -682,8 +667,6 @@ async function supaEcrire(){
   return supaEnCours;
 }
 
-/* Un bandeau discret, visible seulement quand la synchronisation coince :
-   l'étudiant doit savoir tout de suite si son travail ne part pas en ligne. */
 function majBandeau(detail){
   let el = document.getElementById("bandeauSync");
   const enPanne = supaActif() && SUPA.etat === "hors ligne";
@@ -695,8 +678,8 @@ function majBandeau(detail){
       + "background:var(--alerte);color:#fff;font-size:13px;font-weight:600;text-align:center";
     document.body.appendChild(el);
   }
-  el.textContent = "Synchronisation en ligne interrompue — ton travail reste sur cet appareil. "
-    + (detail ? "(" + String(detail).slice(0,80) + ")" : "");
+  el.textContent = "Synchronisation interrompue — ton travail reste sur cet appareil. "
+    + (detail ? "(" + String(detail).slice(0,90) + ")" : "");
 }
 
 /* =========================================================
@@ -775,157 +758,148 @@ async function fouillerStockages(){
   return { trouvailles, journal };
 }
 
-const SQL_SUPA =
-  "-- À coller dans Supabase → SQL Editor → Run\n"
-  + "create table if not exists cahier (\n"
-  + "  user_id uuid primary key references auth.users(id) on delete cascade,\n"
-  + "  contenu jsonb not null default '{}'::jsonb,\n"
-  + "  maj timestamptz not null default now()\n"
-  + ");\n"
-  + "alter table cahier enable row level security;\n"
-  + "drop policy if exists \"chacun le sien\" on cahier;\n"
-  + "create policy \"chacun le sien\" on cahier\n"
-  + "  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);\n"
-  + "create or replace function cahier_proprietaire() returns trigger as $$\n"
-  + "begin new.user_id := auth.uid(); return new; end $$ language plpgsql security definer;\n"
-  + "drop trigger if exists cahier_proprietaire_t on cahier;\n"
-  + "create trigger cahier_proprietaire_t before insert on cahier\n"
-  + "  for each row execute function cahier_proprietaire();";
+const SQL_SUPA = [
+"-- À coller dans Supabase → SQL Editor → Run",
+"drop table if exists cahier cascade;",
+"create table cahier (",
+"  code text primary key,",
+"  contenu jsonb not null default '{}'::jsonb,",
+"  maj timestamptz not null default now()",
+");",
+"alter table cahier enable row level security;",
+"-- Aucun accès direct : tout passe par les deux fonctions ci-dessous,",
+"-- qui exigent le code secret du cahier.",
+"create or replace function cahier_lire(c text)",
+"returns jsonb language sql security definer set search_path = public as $$",
+"  select contenu from cahier where code = c;",
+"$$;",
+"create or replace function cahier_ecrire(c text, j jsonb)",
+"returns void language sql security definer set search_path = public as $$",
+"  insert into cahier(code, contenu, maj) values (c, j, now())",
+"  on conflict (code) do update set contenu = excluded.contenu, maj = now();",
+"$$;",
+"grant execute on function cahier_lire(text)  to anon, authenticated;",
+"grant execute on function cahier_ecrire(text, jsonb) to anon, authenticated;"
+].join("\n");
 
-/* Extrait l'adresse du projet et la clé publique de n'importe quel
-   copier-coller : la page « API Settings » entière, deux lignes, ou les
-   valeurs collées à la suite. Chercher soi-même vaut mieux que demander
-   à l'étudiant de trier. */
+/* Reconnaît l'adresse du projet et la clé publique dans n'importe quel
+   copier-coller. Deux formats de clé coexistent chez Supabase : l'ancien
+   JWT « eyJ… » et le nouveau « sb_publishable_… ». */
 function extraireSupa(txt){
   const t = String(txt || "");
   const url = (t.match(/https?:\/\/[a-z0-9-]+\.supabase\.(?:co|in)/i) || [])[0] || "";
-  // La clé anon est un JWT : trois segments séparés par des points.
-  const cles = t.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g) || [];
-  let cle = "";
-  for(const k of cles){
-    try{
-      const charge = JSON.parse(atob(k.split(".")[1].replace(/-/g,"+").replace(/_/g,"/")));
-      if(charge && charge.role === "anon"){ cle = k; break; }   // jamais la clé « service_role »
-    }catch(e){}
+  let cle = (t.match(/sb_publishable_[A-Za-z0-9_-]{10,}/) || [])[0] || "";
+  if(!cle){
+    const jwts = t.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g) || [];
+    for(const k of jwts){
+      try{
+        const r = JSON.parse(atob(k.split(".")[1].replace(/-/g,"+").replace(/_/g,"/"))).role;
+        if(r === "anon"){ cle = k; break; }        // jamais « service_role »
+      }catch(e){}
+    }
   }
-  if(!cle && cles.length) cle = cles[0];
   return { url, cle };
 }
 
 function ecranSynchronisation(){
-  if(supaActif()){
-    modal('<div class="modal-head"><h2>Mon cahier en ligne</h2>'
-      + '<button class="btn fantome sm" data-x>Fermer</button></div>'
-      + '<div class="modal-body"><div class="card"><h4>Connecté</h4>'
-      + '<p class="note">Compte : <b>' + esc(SUPA.email) + "</b><br>Projet : <b>" + esc(SUPA.url) + "</b></p>"
-      + '<p class="note" style="margin-top:8px">Tout ce que tu écris part en ligne. Ouvre le site depuis '
-      + "n'importe quel appareil, connecte-toi, et tu retrouves ton cahier.</p>"
-      + '<div class="doc-actions"><button class="btn sm" id="syPousser">Tout renvoyer en ligne</button>'
-      + '<button class="btn sm fantome danger" id="syQuitter">Se déconnecter</button></div></div>'
-      + '<div id="syOut"></div></div>'
-      + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Fermer</button></div>', {wide:true});
-    document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
-    const dire = h => { const o = $("#syOut"); if(o) o.innerHTML = h; };
-    $("#syPousser").onclick = async ()=>{
-      dire('<span class="thinking"><i></i>Envoi…</span>');
-      const ok = await supaEcrire();
-      dire(ok ? '<p class="note" style="color:var(--ok)">' + state.items.length + " document(s) envoyés.</p>"
-              : '<p class="note" style="color:var(--alerte)">Envoi impossible. Vérifie ta connexion.</p>');
-    };
-    $("#syQuitter").onclick = ()=>{
-      if(!confirm("Se déconnecter ? Ton cahier reste en ligne et sur cet appareil.")) return;
-      supaDeconnexion(); closeModal(); vueReglages(); toast("Déconnecté.");
-    };
-    return;
-  }
-
-  const dejaRelie = !!(SUPA.url && SUPA.cle);
+  const enLigne = supaActif();
   modal('<div class="modal-head"><h2>Mon cahier en ligne</h2>'
     + '<button class="btn fantome sm" data-x>Fermer</button></div>'
     + '<div class="modal-body"><div class="stack">'
-    + (dejaRelie
-        ? '<p class="note">Projet relié : <b>' + esc(SUPA.url) + '</b> · <button class="btn sm fantome" id="syRelier">changer</button></p>'
-        : '<div><label class="lab" for="syColle">Colle ici ta page Supabase</label>'
-          + '<textarea class="field" id="syColle" rows="4" placeholder="Dans Supabase : Project Settings → API. Sélectionne toute la page (Cmd+A), copie (Cmd+C), colle ici. Je trouve tout seul l\'adresse et la clé."></textarea>'
+    + (enLigne
+        ? '<div class="card"><h4>Ton cahier est en ligne</h4>'
+          + '<p class="note">Mets ce lien en favori. Tu l\'ouvres depuis n\'importe quel appareil et '
+          + "ton cahier est là — rien à saisir, aucun compte.</p>"
+          + '<input class="field" id="syLien" readonly style="margin-top:10px;font-size:12px" value="' + esc(lienCahier()) + '">'
+          + '<div class="doc-actions"><button class="btn pri sm" id="syCopierLien">Copier le lien</button>'
+          + '<button class="btn sm" id="syPousser">Tout renvoyer en ligne</button>'
+          + '<button class="btn sm fantome danger" id="syOublier">Oublier sur cet appareil</button></div>'
+          + '<p class="note" style="margin-top:10px">Ce lien vaut clé : qui l\'a peut lire tes cours. '
+          + "Ne le publie pas.</p></div>"
+        : '<div class="card"><h4>1 · Préparer ton projet</h4>'
+          + '<p class="note">Dans Supabase → <b>SQL Editor</b> → <b>New query</b>, colle ce texte et clique <b>Run</b>. '
+          + "Si tu l'avais déjà fait, refais-le : le contenu a changé.</p>"
+          + '<pre style="max-height:130px;overflow:auto;font-size:11px">' + esc(SQL_SUPA) + "</pre>"
+          + '<div class="doc-actions"><button class="btn sm" id="syCopierSQL">Copier ce texte</button></div></div>'
+          + '<div class="card"><h4>2 · Relier</h4>'
+          + '<p class="note">Dans Supabase → <b>Project Settings</b> → <b>API</b> : sélectionne toute la page '
+          + "(Cmd+A), copie (Cmd+C), colle ici. Je trouve l'adresse et la clé tout seul.</p>"
+          + '<textarea class="field" id="syColle" rows="3" style="margin-top:10px"></textarea>'
           + '<p class="note" id="syTrouve" style="margin-top:6px">En attente…</p></div>')
-    + '<div class="grid2">'
-    +   '<div><label class="lab" for="syMail">Ton adresse électronique</label>'
-    +     '<input class="field" id="syMail" type="email" autocomplete="username" value="' + esc(SUPA.email) + '"></div>'
-    +   '<div><label class="lab" for="syMdp">Un mot de passe</label>'
-    +     '<input class="field" id="syMdp" type="password" autocomplete="current-password" placeholder="6 caractères minimum"></div>'
-    + "</div>"
-    + '<p class="note">Ce mot de passe protège tes cours. Tu es seul à le connaître — je ne le vois jamais.</p>'
     + '<div id="syOut"></div>'
     + "</div></div>"
-    + '<div class="modal-foot"><div style="flex:1"></div>'
-    + '<button class="btn" data-x>Annuler</button>'
-    + '<button class="btn pri" id="syGo">Mettre mon cahier en ligne</button></div>', {wide:true, sticky:true});
+    + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Fermer</button>'
+    + (enLigne ? "" : '<button class="btn pri" id="syGo">Mettre en ligne</button>') + "</div>", {wide:true, sticky:true});
 
   document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
   const dire = h => { const o = $("#syOut"); if(o) o.innerHTML = h; };
+
+  const cSQL = $("#syCopierSQL");
+  if(cSQL) cSQL.onclick = ()=>navigator.clipboard.writeText(SQL_SUPA).then(
+    ()=>toast("Copié — colle-le dans le SQL Editor, puis Run."), ()=>toast("Sélectionne le texte à la main."));
+
+  const cLien = $("#syCopierLien");
+  if(cLien) cLien.onclick = ()=>navigator.clipboard.writeText(lienCahier()).then(
+    ()=>toast("Lien copié — mets-le en favori."), ()=>{ $("#syLien").select(); toast("Copie-le à la main (Cmd+C)."); });
 
   const champ = $("#syColle");
   if(champ){
     const relire = ()=>{
       const { url, cle } = extraireSupa(champ.value);
-      const el = $("#syTrouve");
-      if(!el) return;
-      el.innerHTML = (url ? '✓ adresse : <b>' + esc(url) + "</b>" : "adresse introuvable")
-        + " · " + (cle ? '✓ clé trouvée' : "clé introuvable");
+      const el = $("#syTrouve"); if(!el) return;
+      el.innerHTML = (url ? "✓ adresse trouvée" : "adresse introuvable") + " · " + (cle ? "✓ clé trouvée" : "clé introuvable");
       el.style.color = (url && cle) ? "var(--ok)" : "var(--texte-2)";
     };
     champ.oninput = relire;
     champ.onpaste = ()=>setTimeout(relire, 30);
     setTimeout(()=>champ.focus(), 120);
   }
-  const bRelier = $("#syRelier");
-  if(bRelier) bRelier.onclick = ()=>{ SUPA.url = ""; SUPA.cle = ""; enregistrerSupa(); closeModal(); ecranSynchronisation(); };
 
-  $("#syGo").onclick = async ()=>{
-    let url = SUPA.url, cle = SUPA.cle;
-    if(champ){ const e = extraireSupa(champ.value); url = e.url; cle = e.cle; }
-    const mail = ($("#syMail").value||"").trim(), mdp = $("#syMdp").value || "";
+  const bGo = $("#syGo");
+  if(bGo) bGo.onclick = async ()=>{
+    const { url, cle } = extraireSupa(champ ? champ.value : "");
     if(!url || !cle){
-      dire('<p class="note" style="color:var(--alerte)">Je n\'ai pas trouvé l\'adresse du projet et la clé dans ce que tu as collé. '
-        + "Dans Supabase : <b>Project Settings → API</b>, puis Cmd+A, Cmd+C, et colle ici.</p>"); return;
+      dire('<p class="note" style="color:var(--alerte)">Je n\'ai pas reconnu l\'adresse et la clé. '
+        + "Dans Supabase : <b>Project Settings → API</b>, Cmd+A, Cmd+C, puis colle ici.</p>"); return;
     }
-    if(!mail || mdp.length < 6){
-      dire('<p class="note" style="color:var(--alerte)">Il faut une adresse et un mot de passe d\'au moins 6 caractères.</p>'); return;
-    }
-    SUPA.url = url; SUPA.cle = cle; enregistrerSupa();
-    dire('<span class="thinking"><i></i>Connexion…</span>');
-
-    // On tente d'abord la connexion : si le compte existe déjà, inutile
-    // d'infliger une erreur « déjà enregistré » à l'étudiant.
-    let ok = false;
-    try{ await supaConnexion(mail, mdp, false); ok = true; }
-    catch(e){
-      try{ await supaConnexion(mail, mdp, true); ok = true; }
-      catch(e2){
-        dire('<p class="note" style="color:' + (e2 && e2.code === "confirmation" ? "var(--attention)" : "var(--alerte)") + '">'
-          + esc((e2 && e2.message) || "échec") + "</p>");
-        return;
+    SUPA.url = url; SUPA.cle = cle; SUPA.code = SUPA.code || nouveauCode();
+    enregistrerSupa();
+    dire('<span class="thinking"><i></i>Mise en ligne…</span>');
+    try{
+      const deja = await supaLire();
+      if(deja && deja.items.length){
+        await instantane("avant reprise du cahier en ligne");
+        state.matieres = deja.matieres; state.chapitres = deja.chapitres; state.items = deja.items;
+        localSave();
+        dire('<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> ' + deja.items.length + " document(s) repris.</p>");
+      }else{
+        await supaRPC("cahier_ecrire", { c: SUPA.code,
+          j: { matieres:state.matieres, chapitres:state.chapitres, items:state.items } });
+        dire('<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> Tes ' + state.items.length
+          + " document(s) sont sur ton projet.</p>");
       }
+      SUPA.etat = "en ligne";
+      setTimeout(()=>{ closeModal(); vueReglages(); ecranSynchronisation(); }, 1600);
+    }catch(e){
+      SUPA.code = "";
+      enregistrerSupa();
+      dire('<p class="note" style="color:var(--alerte)">' + esc((e && e.message) || "échec") + "</p>");
     }
-    if(!ok) return;
+  };
 
-    dire('<span class="thinking"><i></i>Récupération de ton cahier…</span>');
-    let enLigne = null;
-    try{ enLigne = await supaLire(); }catch(e){}
-    if(enLigne && enLigne.items.length){
-      await instantane("avant reprise du cahier en ligne");
-      state.matieres = enLigne.matieres; state.chapitres = enLigne.chapitres; state.items = enLigne.items;
-      localSave();
-      dire('<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> ' + enLigne.items.length
-        + " document(s) repris depuis ton compte.</p>");
-    }else{
-      const envoye = await supaEcrire();
-      dire(envoye
-        ? '<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> Tes ' + state.items.length
-          + " document(s) sont sur ton compte. Ouvre le site où tu veux, connecte-toi, tu les retrouveras.</p>"
-        : '<p class="note" style="color:var(--alerte)">Connecté, mais l\'envoi a échoué. As-tu bien exécuté le SQL dans Supabase ?</p>');
-    }
-    setTimeout(()=>{ closeModal(); render(); vueReglages(); }, 2200);
+  const bP = $("#syPousser");
+  if(bP) bP.onclick = async ()=>{
+    dire('<span class="thinking"><i></i>Envoi…</span>');
+    const ok = await supaEcrire();
+    dire(ok ? '<p class="note" style="color:var(--ok)">' + state.items.length + " document(s) envoyés.</p>"
+            : '<p class="note" style="color:var(--alerte)">Envoi impossible.</p>');
+  };
+  const bO = $("#syOublier");
+  if(bO) bO.onclick = ()=>{
+    if(!confirm("Oublier le lien sur cet appareil ? Ton cahier reste en ligne — garde le lien ailleurs, "
+      + "sinon tu ne pourras plus y revenir.")) return;
+    SUPA.url = ""; SUPA.cle = ""; SUPA.code = ""; SUPA.etat = "éteint";
+    enregistrerSupa(); closeModal(); vueReglages();
   };
 }
 
@@ -1066,17 +1040,6 @@ async function loadAll(){
       if(q.size) loadedRemote = true;
     }catch(e){ loadedRemote = false; }
   }
-  // L'en ligne fait autorité : c'est lui qu'on retrouve d'un appareil à l'autre.
-  if(!loadedRemote && supaActif()){
-    try{
-      const d = await supaLire();
-      if(d && (d.items.length || d.matieres.length)){
-        state.matieres = d.matieres; state.chapitres = d.chapitres; state.items = d.items;
-        loadedRemote = true;
-        SUPA.etat = "connecté";
-      }
-    }catch(e){ SUPA.etat = "hors ligne"; }
-  }
   if(!loadedRemote){
     let d = null;
     try{ d = await idbLire("contenu"); }catch(e){}
@@ -1088,6 +1051,28 @@ async function loadAll(){
     }
   }
   state.loaded = true;
+}
+
+/* Le cahier en ligne est rapatrié APRÈS le premier affichage : la page doit
+   apparaître instantanément, avec ce que l'appareil connaît déjà, puis se
+   mettre à jour. Aucune panne réseau ne peut plus laisser un écran vide. */
+async function rejoindreEnLigne(){
+  if(!supaActif()) return;
+  try{
+    const d = await supaLire();
+    if(d && (d.items.length || d.matieres.length)){
+      state.matieres = d.matieres; state.chapitres = d.chapitres; state.items = d.items;
+      SUPA.etat = "en ligne";
+      idbEcrire("contenu", { matieres:state.matieres, chapitres:state.chapitres, items:state.items }).catch(()=>{});
+      render();
+    }else if(state.items.length){
+      supaEcrire();            // le compte est vide : on y verse ce qu'on a
+    }
+    majBandeau();
+  }catch(e){
+    SUPA.etat = "hors ligne";
+    majBandeau(e && e.message);
+  }
 }
 
 /* ---------- sélecteurs ---------- */
@@ -4580,7 +4565,7 @@ function vueReglages(){
     + '<div class="card"><h4>Mon cahier en ligne</h4>'
     +   '<p class="note" id="rSyncEtat">…</p>'
     +   '<div class="doc-actions"><button class="btn pri sm" id="rSync">'
-    +     (supaActif() ? "Gérer la connexion" : "Mettre mon cahier en ligne") + "</button></div></div>"
+    +     (supaActif() ? "Voir mon lien" : "Mettre mon cahier en ligne") + "</button></div></div>"
     + '<div class="card"><h4>Moteur IA</h4>'
     +   '<p class="note"><b>'+(IA.mode==="api"?"Clé directe":IA.mode==="artifact"?"Assistant Claude":"Éteint")+"</b> — "+esc(IA.detail)+"</p>"
     +   '<p class="note" style="margin-top:6px">Lecture des photos : <b style="color:'+(IA.vision?"var(--ok)":"var(--attention)")+'">'
@@ -4630,8 +4615,8 @@ function vueReglages(){
       ? "Tes cours ne vivent que sur cet appareil. Mets-les en ligne pour les retrouver partout, "
         + "et ne plus rien perdre si tu changes de navigateur."
       : (supaActif()
-          ? 'Connecté en tant que <b>' + esc(SUPA.email) + "</b>. Tout ce que tu écris part en ligne automatiquement."
-          : '<b style="color:var(--attention)">Déconnecté.</b> Ton cahier est en ligne, mais il faut te reconnecter pour le retrouver.');
+          ? "Tout ce que tu écris part en ligne automatiquement. Ouvre ton lien depuis n'importe quel appareil."
+          : '<b style="color:var(--attention)">Lien absent sur cet appareil.</b> Ouvre ton lien de cahier pour le retrouver.');
   }
   const bSync = $("#rSync");
   if(bSync) bSync.onclick = ecranSynchronisation;
@@ -4834,6 +4819,7 @@ async function amorcer(){
   chargerConfig();
   chargerSupa();
   await loadAll(); loadPref(); majMode(); render();
+  rejoindreEnLigne();          // volontairement sans await : l'écran est déjà là
 
   if(typeof claude !== "undefined" && claude && claude.use){
     try{ db = await claude.use("db"); }catch(e){}
