@@ -787,7 +787,13 @@ const SQL_SUPA = [
    JWT « eyJ… » et le nouveau « sb_publishable_… ». */
 function extraireSupa(txt){
   const t = String(txt || "");
-  const url = (t.match(/https?:\/\/[a-z0-9-]+\.supabase\.(?:co|in)/i) || [])[0] || "";
+  let url = (t.match(/https?:\/\/[a-z0-9-]+\.supabase\.(?:co|in)/i) || [])[0] || "";
+  // L'adresse du projet se déduit de celle du tableau de bord : coller
+  // n'importe quelle page de son projet suffit, inutile de la chercher.
+  if(!url){
+    const ref = (t.match(/dashboard\/project\/([a-z0-9]{16,})/i) || [])[1];
+    if(ref) url = "https://" + ref + ".supabase.co";
+  }
   let cle = (t.match(/sb_publishable_[A-Za-z0-9_-]{10,}/) || [])[0] || "";
   if(!cle){
     const jwts = t.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g) || [];
@@ -823,7 +829,10 @@ function ecranSynchronisation(){
           + '<div class="doc-actions"><button class="btn sm" id="syCopierSQL">Copier ce texte</button></div></div>'
           + '<div class="card"><h4>2 · Relier</h4>'
           + '<p class="note">Dans Supabase → <b>Project Settings</b> → <b>API</b> : sélectionne toute la page '
-          + "(Cmd+A), copie (Cmd+C), colle ici. Je trouve l'adresse et la clé tout seul.</p>"
+          + "(Cmd+A), copie (Cmd+C), colle ici — <b>l'adresse de la page dans la barre du navigateur y comprise</b>. "
+          + "Je trouve le reste tout seul.</p>"
+          + '<p class="note" style="margin-top:6px">Page introuvable ? Ouvre directement '
+          + '<b>supabase.com/dashboard/project/_/settings/api-keys</b></p>'
           + '<textarea class="field" id="syColle" rows="3" style="margin-top:10px"></textarea>'
           + '<p class="note" id="syTrouve" style="margin-top:6px">En attente…</p></div>')
     + '<div id="syOut"></div>'
