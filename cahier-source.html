@@ -570,27 +570,57 @@ async function instantane(motif){
   }catch(e){ return false; }
 }
 
-/* Ratisse tous les emplacements de stockage connus, y compris ceux qu'une
-   version précédente de l'outil utilisait. Sert quand du contenu a disparu. */
+/* Ratisse TOUS les emplacements possibles, et rend compte de chacun — y
+   compris vide ou en erreur. Un écran qui répond « rien trouvé » sans dire
+   où il a cherché ne permet ni de conclure ni de chercher ailleurs. */
 async function fouillerStockages(){
-  const trouvailles = [];
-  try{
-    const c = await idbLire("contenu");
-    if(c && (c.items||[]).length) trouvailles.push({ ou:"IndexedDB — contenu courant", d:c });
-  }catch(e){}
+  const trouvailles = [], journal = [];
+
+  async function sonder(nom, lire){
+    try{
+      const d = await lire();
+      const n = d && (d.items||[]).length;
+      journal.push({ ou:nom, etat: n ? n + " document(s)" : (d ? "présent mais vide" : "absent") });
+      return d && n ? d : null;
+    }catch(e){
+      journal.push({ ou:nom, etat:"illisible — " + ((e && e.message) || "erreur") });
+      return null;
+    }
+  }
+
+  const c = await sonder("IndexedDB — contenu courant", ()=>idbLire("contenu"));
+  if(c) trouvailles.push({ ou:"IndexedDB — contenu courant", d:c });
+
+  // Le compte Claude : la version artifact y range tout, et ce stockage
+  // survit au navigateur, à l'appareil, et à un vidage de cache.
+  if(db){
+    try{
+      const snap = await db.doc("espace/structure").get();
+      const q = await db.collection("items").limit(1000).get();
+      const items = q.docs.map(x=>({ id:x.id, ...x.data() }));
+      const st = snap.exists ? (snap.data()||{}) : {};
+      journal.push({ ou:"Compte Claude (synchronisé)", etat: items.length ? items.length + " document(s)" : "vide" });
+      if(items.length) trouvailles.push({ ou:"Compte Claude (synchronisé)",
+        d:{ matieres:st.matieres||[], chapitres:st.chapitres||[], items } });
+    }catch(e){ journal.push({ ou:"Compte Claude (synchronisé)", etat:"illisible — " + ((e&&e.message)||"erreur") }); }
+  }else{
+    journal.push({ ou:"Compte Claude (synchronisé)", etat:"indisponible dans cette version" });
+  }
+
   try{
     const l = (await idbLire("sauvegardes")) || [];
-    l.forEach((s,n)=>trouvailles.push({ ou:"Instantané du " + new Date(s.date).toLocaleString("fr-FR") + " (" + s.motif + ")", d:s, snap:n }));
-  }catch(e){}
-  for(const k of [LS_KEY, "cahier-bba", "cahier-bba-v1"]){
-    try{
+    journal.push({ ou:"Instantanés automatiques", etat: l.length ? l.length + " état(s) conservé(s)" : "aucun — le filet a été posé après ta perte" });
+    l.forEach(x=>trouvailles.push({ ou:"Instantané du " + new Date(x.date).toLocaleString("fr-FR") + " (" + x.motif + ")", d:x }));
+  }catch(e){ journal.push({ ou:"Instantanés automatiques", etat:"illisibles" }); }
+
+  for(const k of [LS_KEY, "cahier-bba", "cahier-bba-v0", "cahier"]){
+    const d = await sonder("Ancien stockage « "+k+" »", async ()=>{
       const brut = localStorage.getItem(k);
-      if(!brut) continue;
-      const d = JSON.parse(brut);
-      if(d && (d.items||[]).length) trouvailles.push({ ou:"Ancien stockage « "+k+" »", d });
-    }catch(e){}
+      return brut ? JSON.parse(brut) : null;
+    });
+    if(d) trouvailles.push({ ou:"Ancien stockage « "+k+" »", d });
   }
-  return trouvailles;
+  return { trouvailles, journal };
 }
 
 async function ecranRecuperation(){
@@ -600,18 +630,30 @@ async function ecranRecuperation(){
     + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Fermer</button></div>', {wide:true, sticky:true});
   document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
 
-  const t = await fouillerStockages();
+  const { trouvailles, journal } = await fouillerStockages();
   const out = $("#recOut");
   if(!out) return;
-  if(!t.length){
-    out.innerHTML = '<div class="card"><p class="note">Aucune sauvegarde trouvée sur cet appareil. '
-      + "Si tu as exporté un JSON, passe par « Importer un JSON » dans les réglages.</p></div>";
+
+  const rapport = '<div class="card"><h4>Emplacements examinés</h4>'
+    + journal.map(j=>'<p class="note" style="margin:3px 0">• <b>'+esc(j.ou)+"</b> — "+esc(j.etat)+"</p>").join("")
+    + "</div>";
+
+  if(!trouvailles.length){
+    out.innerHTML = rapport
+      + '<div class="card"><h4>Rien à restaurer ici</h4>'
+      + '<p class="note">Aucun de ces emplacements ne contient de document. Trois pistes, dans cet ordre :</p>'
+      + '<p class="note" style="margin-top:8px">1. <b>Ouvre l\'autre version du cahier.</b> Le site et la version Claude '
+      + "ont des stockages séparés : ce que tu as écrit dans l'un est invisible depuis l'autre.</p>"
+      + '<p class="note">2. <b>Regarde dans l\'autre navigateur ou l\'autre appareil.</b> Safari et Chrome ne partagent rien, '
+      + "ni ton Mac et ton téléphone.</p>"
+      + '<p class="note">3. <b>Un export JSON</b>, s\'il en existe un, se recharge par « Importer un JSON ».</p></div>';
     return;
   }
-  out.innerHTML = '<p class="note">Chaque entrée est un état complet retrouvé sur cet appareil. '
-    + "Restaurer <b>fusionne</b> son contenu avec ton cahier actuel : rien n'est écrasé, "
-    + "les documents déjà présents sont ignorés.</p>"
-    + t.map((x,n)=>{
+
+  out.innerHTML = rapport
+    + '<p class="note">Chaque entrée ci-dessous est un état complet retrouvé. Restaurer <b>fusionne</b> : '
+    + "rien n'est écrasé, les documents déjà présents sont ignorés.</p>"
+    + trouvailles.map((x,n)=>{
         const d = x.d, nb = (d.items||[]).length;
         const parMat = {};
         (d.items||[]).forEach(i=>{
@@ -629,12 +671,12 @@ async function ecranRecuperation(){
       }).join("");
 
   out.querySelectorAll("[data-rest]").forEach(b=>b.onclick=async ()=>{
-    const x = t[Number(b.dataset.rest)], d = x.d;
+    const d = trouvailles[Number(b.dataset.rest)].d;
     await instantane("avant restauration");
     const aId = (arr,id)=>arr.some(y=>y.id===id);
     let nm=0, nc=0, nd=0;
     (d.matieres||[]).forEach(m=>{ if(!aId(state.matieres,m.id)){ state.matieres.push(m); nm++; } });
-    (d.chapitres||[]).forEach(c=>{ if(!aId(state.chapitres,c.id)){ state.chapitres.push(c); nc++; } });
+    (d.chapitres||[]).forEach(c2=>{ if(!aId(state.chapitres,c2.id)){ state.chapitres.push(c2); nc++; } });
     for(const i of (d.items||[])) if(!aId(state.items,i.id)){ state.items.push(i); await saveItem(i); nd++; }
     await saveStructure();
     closeModal(); render();
@@ -4241,62 +4283,32 @@ function vueReglages(){
     +   '<div class="seg" style="margin-top:10px" id="rTheme">'
     +     ['auto','light','dark'].map(t=>'<button data-theme="'+t+'">'+({auto:"Système",light:"Clair",dark:"Sombre"})[t]+"</button>").join("")
     +   "</div></div>"
-    + '<div class="card"><h4>Récupérer du contenu</h4>'
-    +   '<p class="note">Le cahier garde les dix derniers états complets, pris avant chaque suppression '
-    +   "et chaque import. Si quelque chose a disparu, c'est ici qu'on le retrouve.</p>"
-    +   '<div class="doc-actions"><button class="btn pri sm" id="rRecup">Chercher du contenu perdu</button></div></div>'
-    + '<div class="card"><h4>Stockage</h4>'
-    +   '<p class="note" id="rStock">Mesure en cours…</p>'
-    +   '<div class="doc-actions"><button class="btn sm" id="rPurge">Libérer la place inutilisée</button></div></div>'
     + '<div class="card"><h4>Sauvegarde</h4><p class="note">'
     +   (db ? "Tes cours sont enregistrés sur ton compte et suivent cette page d'un appareil à l'autre."
           : "Sauvegarde locale à ce navigateur. Exporte de temps en temps.")
-    +   "</p><p class=\"note\" style=\"margin-top:6px\">"+nb+" document"+(nb>1?"s":"")+" · ~"+poids+" Ko</p>"
+    +   "</p><p class=\"note\" style=\"margin-top:6px\">"+nb+" document"+(nb>1?"s":"")+" · ~"+poids+" Ko"
+    +   " · <span id=\"rStock\">…</span></p>"
+    +   '<p class="note" style="margin-top:6px">Un état complet est conservé avant chaque suppression. '
+    +   "Rien ne se perd sans qu'on puisse revenir dessus.</p>"
     +   '<div class="doc-actions"><button class="btn sm" id="rExp">Exporter en JSON</button>'
-    +   '<button class="btn sm" id="rImp">Importer un JSON</button></div></div>'
+    +   '<button class="btn sm" id="rImp">Importer un JSON</button>'
+    +   '<button class="btn sm fantome" id="rRecup">Retrouver du contenu</button></div></div>'
     + "</div>";
 
   $("#rIA").onclick = openSettings;
   const bRecup = $("#rRecup");
   if(bRecup) bRecup.onclick = ecranRecuperation;
 
-  // Le stockage saturé est invisible tant qu'on ne le mesure pas : c'est lui
-  // qui empêchait la clé API de s'enregistrer.
+  // Le stockage se gère seul ; on n'en dit qu'un mot, et seulement s'il coince.
   (async ()=>{
     const el = $("#rStock"); if(!el) return;
     let ls = 0;
-    try{ for(const k in localStorage) if(Object.prototype.hasOwnProperty.call(localStorage,k)) ls += (localStorage[k]||"").length + k.length; }catch(e){}
-    let quota = null, usage = null;
-    try{
-      if(navigator.storage && navigator.storage.estimate){
-        const e = await navigator.storage.estimate(); quota = e.quota; usage = e.usage;
-      }
-    }catch(e){}
-    const ko = n => (n/1024).toFixed(0) + " Ko";
-    const mo = n => (n/1048576).toFixed(1) + " Mo";
-    el.innerHTML =
-        "Cahier : <b>" + mo(JSON.stringify({m:state.matieres,c:state.chapitres,i:state.items}).length*2) + "</b>"
-      + " dans la base du navigateur (IndexedDB), qui n'a pas la limite de 5 Mo de l'ancien emplacement.<br>"
-      + "Configuration (clés, préférences) : <b>" + ko(ls*2) + "</b>"
-      + (ls*2 > 4000000 ? ' — <b style="color:var(--alerte)">saturée</b>, c\'est ce qui empêche d\'enregistrer une clé.' : ".")
-      + (usage != null ? "<br>Espace utilisé par le site : " + mo(usage)
-          + (quota ? " sur " + mo(quota) + " autorisés." : ".") : "");
+    try{ for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); ls += k.length + (localStorage.getItem(k)||"").length; } }catch(e){}
+    el.innerHTML = ls*2 > 4000000
+      ? '<b style="color:var(--alerte)">stockage saturé</b>'
+      : "enregistré sur cet appareil";
   })();
 
-  const bPurge = $("#rPurge");
-  if(bPurge) bPurge.onclick = ()=>{
-    let libere = 0;
-    try{
-      const v = localStorage.getItem(LS_KEY);
-      if(v){ libere = v.length; localStorage.removeItem(LS_KEY); }
-    }catch(e){}
-    localSave();   // réécrit le contenu dans IndexedDB, à sa bonne place
-    toast(libere ? "Ancien emplacement vidé — " + (libere*2/1048576).toFixed(1) + " Mo rendus."
-                 : "Rien à libérer : la configuration est déjà au large.", 4500);
-    setTimeout(vueReglages, 600);
-  };
-  $("#rQual").querySelectorAll("[data-q]").forEach(b=>b.onclick=()=>{ reglerQualite(b.dataset.q); vueReglages(); });
-  $("#rPlaf").querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{ reglerPlafond(Number(b.dataset.p)); vueReglages(); });
   $("#rEpreuve").onclick = async ()=>{
     const btn = $("#rEpreuve"), out = $("#rEpOut");
     if(IA.mode === "off" || !IA.vision){
