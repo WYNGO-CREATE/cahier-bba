@@ -621,7 +621,23 @@ function nouveauCode(){
 
 /* Les deux seuls appels réseau : une fonction pour lire, une pour écrire.
    Le code secret voyage dans le corps de la requête, jamais dans l'URL. */
+/* L'extraction des PDF laisse parfois des caracteres de controle — dont
+   l'octet nul, que PostgreSQL refuse dans du JSON. Sans ce nettoyage, une
+   seule page mal encodee bloquait toute la sauvegarde en ligne. */
+const CTRL = new RegExp("[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\u007F]", "g");
+function assainir(x){
+  if(typeof x === "string") return x.replace(CTRL, "");
+  if(Array.isArray(x)) return x.map(assainir);
+  if(x && typeof x === "object"){
+    const o = {};
+    for(const k in x) if(Object.prototype.hasOwnProperty.call(x,k)) o[k] = assainir(x[k]);
+    return o;
+  }
+  return x;
+}
+
 async function supaRPC(fonction, args){
+  args = assainir(args);
   // Un serveur injoignable ne doit jamais faire attendre : sans cette borne,
   // une adresse de projet erronée laissait la page blanche indéfiniment.
   const ctl = new AbortController();
