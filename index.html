@@ -800,102 +800,140 @@ const SQL_SUPA =
   + "create trigger cahier_proprietaire_t before insert on cahier\n"
   + "  for each row execute function cahier_proprietaire();";
 
-function ecranSynchronisation(){
-  const etape = (n, titre, corps) =>
-    '<div class="card"><h4>' + n + " · " + titre + "</h4>" + corps + "</div>";
+/* Extrait l'adresse du projet et la clé publique de n'importe quel
+   copier-coller : la page « API Settings » entière, deux lignes, ou les
+   valeurs collées à la suite. Chercher soi-même vaut mieux que demander
+   à l'étudiant de trier. */
+function extraireSupa(txt){
+  const t = String(txt || "");
+  const url = (t.match(/https?:\/\/[a-z0-9-]+\.supabase\.(?:co|in)/i) || [])[0] || "";
+  // La clé anon est un JWT : trois segments séparés par des points.
+  const cles = t.match(/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g) || [];
+  let cle = "";
+  for(const k of cles){
+    try{
+      const charge = JSON.parse(atob(k.split(".")[1].replace(/-/g,"+").replace(/_/g,"/")));
+      if(charge && charge.role === "anon"){ cle = k; break; }   // jamais la clé « service_role »
+    }catch(e){}
+  }
+  if(!cle && cles.length) cle = cles[0];
+  return { url, cle };
+}
 
+function ecranSynchronisation(){
+  if(supaActif()){
+    modal('<div class="modal-head"><h2>Mon cahier en ligne</h2>'
+      + '<button class="btn fantome sm" data-x>Fermer</button></div>'
+      + '<div class="modal-body"><div class="card"><h4>Connecté</h4>'
+      + '<p class="note">Compte : <b>' + esc(SUPA.email) + "</b><br>Projet : <b>" + esc(SUPA.url) + "</b></p>"
+      + '<p class="note" style="margin-top:8px">Tout ce que tu écris part en ligne. Ouvre le site depuis '
+      + "n'importe quel appareil, connecte-toi, et tu retrouves ton cahier.</p>"
+      + '<div class="doc-actions"><button class="btn sm" id="syPousser">Tout renvoyer en ligne</button>'
+      + '<button class="btn sm fantome danger" id="syQuitter">Se déconnecter</button></div></div>'
+      + '<div id="syOut"></div></div>'
+      + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Fermer</button></div>', {wide:true});
+    document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+    const dire = h => { const o = $("#syOut"); if(o) o.innerHTML = h; };
+    $("#syPousser").onclick = async ()=>{
+      dire('<span class="thinking"><i></i>Envoi…</span>');
+      const ok = await supaEcrire();
+      dire(ok ? '<p class="note" style="color:var(--ok)">' + state.items.length + " document(s) envoyés.</p>"
+              : '<p class="note" style="color:var(--alerte)">Envoi impossible. Vérifie ta connexion.</p>');
+    };
+    $("#syQuitter").onclick = ()=>{
+      if(!confirm("Se déconnecter ? Ton cahier reste en ligne et sur cet appareil.")) return;
+      supaDeconnexion(); closeModal(); vueReglages(); toast("Déconnecté.");
+    };
+    return;
+  }
+
+  const dejaRelie = !!(SUPA.url && SUPA.cle);
   modal('<div class="modal-head"><h2>Mon cahier en ligne</h2>'
     + '<button class="btn fantome sm" data-x>Fermer</button></div>'
     + '<div class="modal-body"><div class="stack">'
-    + (supaActif()
-        ? '<div class="card"><h4>Connecté</h4><p class="note">Compte : <b>' + esc(SUPA.email) + "</b><br>"
-          + "Projet : <b>" + esc(SUPA.url) + "</b></p>"
-          + '<p class="note" style="margin-top:8px">Tout ce que tu écris part en ligne. Ouvre le site depuis '
-          + "n'importe quel appareil, connecte-toi, et tu retrouves ton cahier.</p>"
-          + '<div class="doc-actions"><button class="btn sm" id="syPousser">Tout renvoyer en ligne</button>'
-          + '<button class="btn sm fantome danger" id="syQuitter">Se déconnecter</button></div></div>'
-        : etape(1, "Créer le projet",
-            '<p class="note">Va sur <b>supabase.com</b>, crée un compte gratuit, puis un projet '
-            + "(n'importe quel nom, garde la région Europe). C'est gratuit et sans carte bancaire.</p>")
-        + etape(2, "Créer la table",
-            '<p class="note">Dans ton projet : menu <b>SQL Editor</b> → <b>New query</b>. Colle ce texte, puis <b>Run</b>.</p>'
-            + '<pre style="max-height:150px;overflow:auto;font-size:11px">' + esc(SQL_SUPA) + "</pre>"
-            + '<div class="doc-actions"><button class="btn sm" id="syCopier">Copier le texte</button></div>')
-        + etape(3, "Relier le cahier",
-            '<p class="note">Dans Supabase : <b>Project Settings</b> → <b>API</b>. Copie les deux valeurs.</p>'
-            + '<div style="margin-top:10px"><label class="lab" for="syUrl">Project URL</label>'
-            + '<input class="field" id="syUrl" placeholder="https://xxxx.supabase.co" value="' + esc(SUPA.url) + '"></div>'
-            + '<div style="margin-top:10px"><label class="lab" for="syCle">Clé « anon public »</label>'
-            + '<input class="field" id="syCle" placeholder="eyJ..." value="' + esc(SUPA.cle) + '"></div>')
-        + etape(4, "Ton compte",
-            '<p class="note">Choisis une adresse et un mot de passe : ce sont eux qui protègent tes cours. '
-            + "Personne d'autre ne peut les lire, même en connaissant l'adresse du projet.</p>"
-            + '<div style="margin-top:10px"><label class="lab" for="syMail">Adresse électronique</label>'
-            + '<input class="field" id="syMail" type="email" autocomplete="username" value="' + esc(SUPA.email) + '"></div>'
-            + '<div style="margin-top:10px"><label class="lab" for="syMdp">Mot de passe</label>'
-            + '<input class="field" id="syMdp" type="password" autocomplete="current-password" placeholder="au moins 6 caractères"></div>'
-            + '<div class="doc-actions"><button class="btn pri sm" id="syCreer">Créer mon compte</button>'
-            + '<button class="btn sm" id="syEntrer">J\'ai déjà un compte</button></div>'))
+    + (dejaRelie
+        ? '<p class="note">Projet relié : <b>' + esc(SUPA.url) + '</b> · <button class="btn sm fantome" id="syRelier">changer</button></p>'
+        : '<div><label class="lab" for="syColle">Colle ici ta page Supabase</label>'
+          + '<textarea class="field" id="syColle" rows="4" placeholder="Dans Supabase : Project Settings → API. Sélectionne toute la page (Cmd+A), copie (Cmd+C), colle ici. Je trouve tout seul l\'adresse et la clé."></textarea>'
+          + '<p class="note" id="syTrouve" style="margin-top:6px">En attente…</p></div>')
+    + '<div class="grid2">'
+    +   '<div><label class="lab" for="syMail">Ton adresse électronique</label>'
+    +     '<input class="field" id="syMail" type="email" autocomplete="username" value="' + esc(SUPA.email) + '"></div>'
+    +   '<div><label class="lab" for="syMdp">Un mot de passe</label>'
+    +     '<input class="field" id="syMdp" type="password" autocomplete="current-password" placeholder="6 caractères minimum"></div>'
+    + "</div>"
+    + '<p class="note">Ce mot de passe protège tes cours. Tu es seul à le connaître — je ne le vois jamais.</p>'
     + '<div id="syOut"></div>'
     + "</div></div>"
-    + '<div class="modal-foot"><div style="flex:1"></div><button class="btn" data-x>Fermer</button></div>',
-    {wide:true, sticky:true});
+    + '<div class="modal-foot"><div style="flex:1"></div>'
+    + '<button class="btn" data-x>Annuler</button>'
+    + '<button class="btn pri" id="syGo">Mettre mon cahier en ligne</button></div>', {wide:true, sticky:true});
 
   document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
-  const out = ()=>$("#syOut");
-  const dire = (html)=>{ const o = out(); if(o) o.innerHTML = html; };
+  const dire = h => { const o = $("#syOut"); if(o) o.innerHTML = h; };
 
-  const cop = $("#syCopier");
-  if(cop) cop.onclick = ()=>{
-    navigator.clipboard.writeText(SQL_SUPA).then(
-      ()=>toast("Texte copié — colle-le dans le SQL Editor de Supabase."),
-      ()=>toast("Copie impossible : sélectionne le texte à la main."));
-  };
+  const champ = $("#syColle");
+  if(champ){
+    const relire = ()=>{
+      const { url, cle } = extraireSupa(champ.value);
+      const el = $("#syTrouve");
+      if(!el) return;
+      el.innerHTML = (url ? '✓ adresse : <b>' + esc(url) + "</b>" : "adresse introuvable")
+        + " · " + (cle ? '✓ clé trouvée' : "clé introuvable");
+      el.style.color = (url && cle) ? "var(--ok)" : "var(--texte-2)";
+    };
+    champ.oninput = relire;
+    champ.onpaste = ()=>setTimeout(relire, 30);
+    setTimeout(()=>champ.focus(), 120);
+  }
+  const bRelier = $("#syRelier");
+  if(bRelier) bRelier.onclick = ()=>{ SUPA.url = ""; SUPA.cle = ""; enregistrerSupa(); closeModal(); ecranSynchronisation(); };
 
-  const brancher = async (creer)=>{
-    const url = ($("#syUrl").value||"").trim(), cle = ($("#syCle").value||"").trim();
+  $("#syGo").onclick = async ()=>{
+    let url = SUPA.url, cle = SUPA.cle;
+    if(champ){ const e = extraireSupa(champ.value); url = e.url; cle = e.cle; }
     const mail = ($("#syMail").value||"").trim(), mdp = $("#syMdp").value || "";
-    if(!url || !cle){ dire('<p class="note" style="color:var(--alerte)">Renseigne d\'abord l\'adresse du projet et la clé (étape 3).</p>'); return; }
-    if(!mail || !mdp){ dire('<p class="note" style="color:var(--alerte)">Il faut une adresse et un mot de passe.</p>'); return; }
-    SUPA.url = url; SUPA.cle = cle; enregistrerSupa();
-    dire('<span class="thinking"><i></i>' + (creer ? "Création du compte…" : "Connexion…") + "</span>");
-    try{
-      await supaConnexion(mail, mdp, creer);
-      dire('<span class="thinking"><i></i>Récupération de ton cahier…</span>');
-      let enLigne = null;
-      try{ enLigne = await supaLire(); }catch(e){}
-      if(enLigne && enLigne.items.length){
-        await instantane("avant reprise du cahier en ligne");
-        state.matieres = enLigne.matieres; state.chapitres = enLigne.chapitres; state.items = enLigne.items;
-        localSave();
-        dire('<p class="note" style="color:var(--ok)"><b>Connecté.</b> ' + enLigne.items.length + " document(s) repris depuis ton compte.</p>");
-      }else{
-        await supaEcrire();
-        dire('<p class="note" style="color:var(--ok)"><b>Connecté.</b> Ton cahier ('
-          + state.items.length + " document(s)) est maintenant en ligne.</p>");
-      }
-      setTimeout(()=>{ closeModal(); render(); vueReglages(); }, 1400);
-    }catch(e){
-      const m = (e && e.message) || "échec";
-      dire('<p class="note" style="color:' + (e && e.code === "confirmation" ? "var(--attention)" : "var(--alerte)") + '">'
-        + esc(m) + "</p>");
+    if(!url || !cle){
+      dire('<p class="note" style="color:var(--alerte)">Je n\'ai pas trouvé l\'adresse du projet et la clé dans ce que tu as collé. '
+        + "Dans Supabase : <b>Project Settings → API</b>, puis Cmd+A, Cmd+C, et colle ici.</p>"); return;
     }
-  };
+    if(!mail || mdp.length < 6){
+      dire('<p class="note" style="color:var(--alerte)">Il faut une adresse et un mot de passe d\'au moins 6 caractères.</p>'); return;
+    }
+    SUPA.url = url; SUPA.cle = cle; enregistrerSupa();
+    dire('<span class="thinking"><i></i>Connexion…</span>');
 
-  const bC = $("#syCreer"); if(bC) bC.onclick = ()=>brancher(true);
-  const bE = $("#syEntrer"); if(bE) bE.onclick = ()=>brancher(false);
+    // On tente d'abord la connexion : si le compte existe déjà, inutile
+    // d'infliger une erreur « déjà enregistré » à l'étudiant.
+    let ok = false;
+    try{ await supaConnexion(mail, mdp, false); ok = true; }
+    catch(e){
+      try{ await supaConnexion(mail, mdp, true); ok = true; }
+      catch(e2){
+        dire('<p class="note" style="color:' + (e2 && e2.code === "confirmation" ? "var(--attention)" : "var(--alerte)") + '">'
+          + esc((e2 && e2.message) || "échec") + "</p>");
+        return;
+      }
+    }
+    if(!ok) return;
 
-  const bP = $("#syPousser");
-  if(bP) bP.onclick = async ()=>{
-    dire('<span class="thinking"><i></i>Envoi…</span>');
-    const ok = await supaEcrire();
-    dire(ok ? '<p class="note" style="color:var(--ok)">' + state.items.length + " document(s) envoyés.</p>"
-            : '<p class="note" style="color:var(--alerte)">Envoi impossible. Vérifie ta connexion.</p>');
-  };
-  const bQ = $("#syQuitter");
-  if(bQ) bQ.onclick = ()=>{
-    if(!confirm("Se déconnecter ? Ton cahier reste en ligne et sur cet appareil.")) return;
-    supaDeconnexion(); closeModal(); vueReglages(); toast("Déconnecté.");
+    dire('<span class="thinking"><i></i>Récupération de ton cahier…</span>');
+    let enLigne = null;
+    try{ enLigne = await supaLire(); }catch(e){}
+    if(enLigne && enLigne.items.length){
+      await instantane("avant reprise du cahier en ligne");
+      state.matieres = enLigne.matieres; state.chapitres = enLigne.chapitres; state.items = enLigne.items;
+      localSave();
+      dire('<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> ' + enLigne.items.length
+        + " document(s) repris depuis ton compte.</p>");
+    }else{
+      const envoye = await supaEcrire();
+      dire(envoye
+        ? '<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> Tes ' + state.items.length
+          + " document(s) sont sur ton compte. Ouvre le site où tu veux, connecte-toi, tu les retrouveras.</p>"
+        : '<p class="note" style="color:var(--alerte)">Connecté, mais l\'envoi a échoué. As-tu bien exécuté le SQL dans Supabase ?</p>');
+    }
+    setTimeout(()=>{ closeModal(); render(); vueReglages(); }, 2200);
   };
 }
 
