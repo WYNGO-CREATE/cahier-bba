@@ -586,7 +586,7 @@ window.addEventListener("hashchange", async ()=>{
     try{
       const d = await supaLire();
       if(d && (d.items.length || d.matieres.length)){
-        state.matieres = d.matieres; state.chapitres = d.chapitres; state.items = d.items;
+        appliquer(fusionnerCahiers(contenuCahier(), d));
         localSave(); render();
         toast(d.items.length + " document(s) retrouvés.", 4000);
       }
@@ -659,28 +659,40 @@ async function supaRPC(fonction, args){
 async function supaLire(){
   const c = await supaRPC("cahier_lire", { c: SUPA.code });
   if(!c) return null;
-  return { matieres:c.matieres||[], chapitres:c.chapitres||[], items:c.items||[] };
+  return { matieres:c.matieres||[], chapitres:c.chapitres||[], items:c.items||[],
+           supprimes:c.supprimes||{ items:[], chapitres:[], matieres:[] } };
 }
 
-let supaEnCours = null, supaAttente = false;
-async function supaEcrire(){
-  if(!supaActif()) return false;
-  if(supaEnCours){ supaAttente = true; return supaEnCours; }
-  supaEnCours = (async ()=>{
-    try{
-      await supaRPC("cahier_ecrire", { c: SUPA.code,
-        j: { matieres:state.matieres, chapitres:state.chapitres, items:state.items } });
-      SUPA.etat = "en ligne"; majBandeau();
-      return true;
-    }catch(e){
-      SUPA.etat = "hors ligne"; majBandeau(e && e.message);
-      return false;
-    }finally{
-      supaEnCours = null;
-      if(supaAttente){ supaAttente = false; supaEcrire(); }
+/* Écriture brute. N'est appelée QUE par synchroniser(), après fusion. */
+async function ecrireEnLigne(c){
+  await supaRPC("cahier_ecrire", { c: SUPA.code, j: c });
+}
+
+/* Les sauvegardes déclenchent une synchronisation regroupée : plusieurs
+   modifications rapprochées ne font qu'un aller-retour. */
+let minuterieSync = null, attentesSync = [], syncEnCours = null, syncEncore = false;
+function supaEcrire(){
+  if(!supaActif()) return Promise.resolve(false);
+  clearTimeout(minuterieSync);
+  return new Promise(ok=>{
+    attentesSync.push(ok);
+    minuterieSync = setTimeout(async ()=>{
+      const l = attentesSync; attentesSync = [];
+      const r = await synchroniser();
+      l.forEach(f=>f(r));
+    }, 1500);
+  });
+}
+function synchroniser(){
+  if(syncEnCours){ syncEncore = true; return syncEnCours; }
+  syncEnCours = (async ()=>{
+    try{ return await rejoindreEnLigne(); }
+    finally{
+      syncEnCours = null;
+      if(syncEncore){ syncEncore = false; synchroniser(); }
     }
   })();
-  return supaEnCours;
+  return syncEnCours;
 }
 
 function majBandeau(detail){
@@ -894,12 +906,12 @@ function ecranSynchronisation(){
       const deja = await supaLire();
       if(deja && deja.items.length){
         await instantane("avant reprise du cahier en ligne");
-        state.matieres = deja.matieres; state.chapitres = deja.chapitres; state.items = deja.items;
+        appliquer(fusionnerCahiers(contenuCahier(), deja));
         localSave();
         dire('<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> ' + deja.items.length + " document(s) repris.</p>");
       }else{
         await supaRPC("cahier_ecrire", { c: SUPA.code,
-          j: { matieres:state.matieres, chapitres:state.chapitres, items:state.items } });
+          j: contenuCahier() });
         dire('<p class="note" style="color:var(--ok)"><b>C\'est en ligne.</b> Tes ' + state.items.length
           + " document(s) sont sur ton projet.</p>");
       }
@@ -989,12 +1001,87 @@ async function ecranRecuperation(){
   });
 }
 
+/* Contenu complet du cahier. « supprimes » garde la trace des éléments effacés,
+   pour qu'une fusion entre appareils ne les fasse pas réapparaître. */
+function contenuCahier(){
+  return { matieres:state.matieres, chapitres:state.chapitres, items:state.items,
+           supprimes: state.supprimes || { items:[], chapitres:[], matieres:[] } };
+}
+function appliquer(c){
+  state.matieres = c.matieres || []; state.chapitres = c.chapitres || []; state.items = c.items || [];
+  state.supprimes = c.supprimes || { items:[], chapitres:[], matieres:[] };
+}
+function enterrer(genre, id){
+  state.supprimes = state.supprimes || { items:[], chapitres:[], matieres:[] };
+  const l = state.supprimes[genre] = state.supprimes[genre] || [];
+  if(id && l.indexOf(id) < 0){ l.push(id); if(l.length > 3000) l.splice(0, l.length - 3000); }
+}
+
+/* FUSION de deux états du cahier — le cœur de la synchronisation.
+   Aucune écriture en ligne n'écrase plus ce qui s'y trouve : on lit, on fusionne,
+   puis on écrit le résultat. C'est ce qui manquait quand un navigateur neuf a
+   remplacé les 364 documents du semestre par ses onze matières vides.
+   Règles : union par identifiant ; la version la plus récente (maj, sinon date)
+   l'emporte, l'appareil local à égalité ; un élément enterré ne revient jamais ;
+   un même fichier importé sous deux identifiants n'est gardé qu'une fois ; les
+   matières vides en double (même nom) sont écartées. */
+function fusionnerCahiers(loc, dist){
+  loc = loc || {}; dist = dist || {};
+  const V = { items:[], chapitres:[], matieres:[] };
+  const tL = loc.supprimes || V, tD = dist.supprimes || V;
+  const supprimes = {};
+  for(const k of ["items","chapitres","matieres"]){
+    supprimes[k] = [...new Set([...(tD[k]||[]), ...(tL[k]||[])])].slice(-3000);
+  }
+  const quand = x => String(x.maj || x.date || "");
+  function union(k){
+    const mort = new Set(supprimes[k]), res = new Map();
+    for(const x of (dist[k]||[])) if(x && x.id && !mort.has(x.id)) res.set(x.id, x);
+    for(const x of (loc[k]||[])){
+      if(!x || !x.id || mort.has(x.id)) continue;
+      const y = res.get(x.id);
+      if(!y || quand(x) >= quand(y)) res.set(x.id, x);
+    }
+    return [...res.values()];
+  }
+  let items = union("items");
+  const parChemin = new Map(), libres = [];
+  const valeur = z => (z.scan ? 0 : 1e8) + String(z.contenu||"").length;
+  for(const it of items){
+    if(!it.chemin){ libres.push(it); continue; }
+    const y = parChemin.get(it.chemin);
+    if(!y || valeur(it) > valeur(y) || (valeur(it) === valeur(y) && quand(it) > quand(y))) parChemin.set(it.chemin, it);
+  }
+  items = libres.concat([...parChemin.values()]);
+  const chapitres = union("chapitres");
+  let matieres = union("matieres");
+  const occupee = id => items.some(i=>i.matiereId===id) || chapitres.some(c=>c.matiereId===id);
+  const enLigne = new Set((dist.matieres||[]).map(x=>x.id));
+  const nom = x => String(x.nom||"").trim().toLowerCase();
+  const garde = matieres.filter(x => occupee(x.id) || enLigne.has(x.id) || !(dist.matieres||[]).length);
+  const noms = new Set(garde.map(nom));
+  for(const x of matieres) if(garde.indexOf(x) < 0 && !noms.has(nom(x))){ garde.push(x); noms.add(nom(x)); }
+  matieres = garde.sort((a,b)=>(a.ordre||0)-(b.ordre||0));
+  return { matieres, chapitres, items, supprimes };
+}
+
+/* Empreinte légère : sert à savoir s'il faut écrire, sans comparer 2 Mo de texte. */
+function empreinte(c){
+  c = c || {};
+  const it = (c.items||[]).map(i=>i.id+":"+(i.chapitreId||"")+":"+(i.ordre==null?"":i.ordre)+":"+(i.maj||i.date||"")
+    +":"+String(i.contenu||"").length+":"+(i.titre||"")+":"+(i.scan?1:0)).sort().join("|");
+  const ch = (c.chapitres||[]).map(x=>x.id+":"+x.titre+":"+x.numero+":"+x.statut+":"+x.matiereId).sort().join("|");
+  const ma = (c.matieres||[]).map(x=>x.id+":"+x.nom+":"+(x.code||"")+":"+(x.prof||"")).sort().join("|");
+  const t = c.supprimes || {};
+  return [it, ch, ma, (t.items||[]).length, (t.chapitres||[]).length, (t.matieres||[]).length].join("#");
+}
+
 let quotaSignale = false;
 function localSave(){
   // Le cahier part en ligne à chaque changement ; le stockage de l'appareil
   // n'est plus qu'un cache pour travailler hors connexion.
   if(supaActif()) supaEcrire();
-  const paquet = { matieres: state.matieres, chapitres: state.chapitres, items: state.items };
+  const paquet = contenuCahier();
   idbEcrire("contenu", paquet).catch(e=>{
     // Repli : seulement si le cahier est assez petit pour y tenir. Sinon on
     // préfère ne rien écrire plutôt que de saturer la place de la clé API.
@@ -1035,6 +1122,7 @@ async function saveStructure(){
 }
 
 async function saveItem(it){
+  it.maj = new Date().toISOString();
   localSave();
   if(!db) return;
   try{
@@ -1044,6 +1132,7 @@ async function saveItem(it){
 }
 
 async function deleteItem(id){
+  enterrer("items", id);
   state.items = state.items.filter(x=>x.id!==id);
   localSave();
   if(db){ try{ await db.doc("items/"+id).delete(); }catch(e){} }
@@ -1070,9 +1159,8 @@ async function loadAll(){
     try{ d = await idbLire("contenu"); }catch(e){}
     if(!d) d = await migrerDepuisLocalStorage();
     if(d){
-      state.matieres = d.matieres || []; state.chapitres = d.chapitres || []; state.items = d.items || [];
-      // Ce qui n'existait que sur cet appareil rejoint le compte en ligne.
-      if(supaActif() && (state.items.length || state.matieres.length)) supaEcrire();
+      appliquer(d);
+      // Plus d'envoi ici : on n'écrit jamais en ligne avant d'avoir lu et fusionné.
     }
   }
   state.loaded = true;
@@ -1081,22 +1169,30 @@ async function loadAll(){
 /* Le cahier en ligne est rapatrié APRÈS le premier affichage : la page doit
    apparaître instantanément, avec ce que l'appareil connaît déjà, puis se
    mettre à jour. Aucune panne réseau ne peut plus laisser un écran vide. */
+let relanceSync = null;
 async function rejoindreEnLigne(){
-  if(!supaActif()) return;
+  if(!supaActif()) return false;
   try{
-    const d = await supaLire();
-    if(d && (d.items.length || d.matieres.length)){
-      state.matieres = d.matieres; state.chapitres = d.chapitres; state.items = d.items;
-      SUPA.etat = "en ligne";
-      idbEcrire("contenu", { matieres:state.matieres, chapitres:state.chapitres, items:state.items }).catch(()=>{});
+    const dist = (await supaLire()) || { matieres:[], chapitres:[], items:[] };
+    const loc = contenuCahier();
+    const f = fusionnerCahiers(loc, dist);
+    // Filet ultime : une fusion ne doit jamais vider un cahier qui contient des documents.
+    if(dist.items.length && !f.items.length) throw new Error("synchronisation refusée : elle aurait vidé le cahier en ligne");
+    const e = empreinte(f);
+    if(e !== empreinte(loc)){
+      appliquer(f);
+      idbEcrire("contenu", contenuCahier()).catch(()=>{});
       render();
-    }else if(state.items.length){
-      supaEcrire();            // le compte est vide : on y verse ce qu'on a
     }
+    if(e !== empreinte(dist) && (f.items.length || f.matieres.length)) await ecrireEnLigne(f);
+    SUPA.etat = "en ligne";
     majBandeau();
+    return true;
   }catch(e){
     SUPA.etat = "hors ligne";
     majBandeau(e && e.message);
+    if(!relanceSync) relanceSync = setTimeout(()=>{ relanceSync = null; synchroniser(); }, 30000);
+    return false;
   }
 }
 
@@ -2051,7 +2147,7 @@ const NIVEAU = "L'utilisateur est étudiant en 1re année du Global BBA de l'ESS
   + "Ne survends rien, ne fais pas de compliments, va droit au fait.";
 
 function ctxChapitre(c, maxChars){
-  const its = itemsOf(c.id), m = matById(c.matiereId);
+  const its = itemsOf(c.id).filter(i=>!sansTexte(i)), m = matById(c.matiereId);
   let txt = "MATIÈRE : " + (m?m.nom:"?") + "\nCHAPITRE " + (c.numero||"?") + " : " + c.titre + "\n\n";
   const budget = maxChars || 26000, per = Math.max(1200, Math.floor(budget / Math.max(1,its.length)));
   its.forEach(i=>{
@@ -2290,6 +2386,8 @@ function openMatieresModal(){
     }
     for(const s of supprimes){
       for(const it of itemsOfMat(s.id)) await deleteItem(it.id);
+      state.chapitres.filter(c=>c.matiereId===s.id).forEach(c=>enterrer("chapitres", c.id));
+      enterrer("matieres", s.id);
       state.chapitres = state.chapitres.filter(c=>c.matiereId!==s.id);
     }
     state.matieres = next;
@@ -2337,6 +2435,7 @@ async function delChapitre(cid){
     + (n?"\n\nUne sauvegarde est conservée : Réglages → Récupérer du contenu.":""))) return;
   if(n) await instantane("avant suppression du thème " + c.titre);
   for(const it of itemsOf(cid)) await deleteItem(it.id);
+  enterrer("chapitres", cid);
   state.chapitres = state.chapitres.filter(x=>x.id!==cid);
   state.openChaps.delete(cid); if(state.selChap===cid) state.selChap = null;
   await saveStructure(); render(); toast("Chapitre supprimé");
@@ -3325,7 +3424,15 @@ async function entrainerChapitre(cid){
 
   // Sans document, on ne peut s'appuyer que sur ce que le programme annonce :
   // on le dit à l'étudiant plutôt que de fabriquer du hors-sujet en silence.
-  const ancre = its.length > 0;
+  const ancre = its.filter(i=>!sansTexte(i)).length > 0;
+  // Les sujets d'examen de la matière servent de gabarit : les exercices doivent
+  // ressembler à ce qui tombe réellement, pas à un manuel générique.
+  const titresTh = {}; state.chapitres.forEach(x=>{ titresTh[x.id] = x.titre; });
+  const anx = annalesDe(c.matiereId, motsUtiles(c.titre), titresTh, 9000);
+  const refAnnales = anx.nb
+    ? "SUJETS D'EXAMEN DE LA MATIÈRE — inspire-toi de leur forme (type de questions, barème, niveau), "
+      + "sans les recopier :\n" + anx.texte + "\n\n"
+    : "";
   const base = ancre
     ? "DOCUMENTS DE CE THÈME — c'est ta seule source :\n\n" + ctxChapitre(c, 30000)
     : "MATIÈRE : " + (m?m.nom:"?") + "\nTHÈME : " + c.titre
@@ -3339,7 +3446,7 @@ async function entrainerChapitre(cid){
         + "effectivement traité dans les documents fournis : ni plus difficile, ni hors-programme.",
       messages: [{ role:"user", content:
         base + "\n\n"
-        + "Rédige une série d'entraînement sur le thème « " + c.titre + " » en markdown, structurée ainsi :\n"
+        + refAnnales + "Rédige une série d'entraînement sur le thème « " + c.titre + " » en markdown, structurée ainsi :\n"
         + "## Énoncés\n"
         + "Six exercices numérotés, de difficulté croissante : deux d'application directe, trois de "
         + "raisonnement, un plus exigeant qui combine plusieurs notions du thème.\n"
@@ -3355,7 +3462,8 @@ async function entrainerChapitre(cid){
               + "pour le style et le niveau, mais propose des énoncés NOUVEAUX, avec d'autres valeurs.\n"
             : "")
         + "Formules en LaTeX entre $…$, tableaux en markdown. Les valeurs numériques doivent tomber juste "
-        + "ou presque : vérifie tes calculs avant d'écrire le corrigé." }],
+        + "ou presque : refais chaque calcul avant d'écrire le corrigé. N'invente aucune formule ni définition "
+        + "absente des documents ; si le cours fourni contient une erreur, signale-la." }],
       effort: "high", maxTokens: 16000, signal: ch.signal,
       onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
     });
@@ -3382,6 +3490,8 @@ async function entrainerChapitre(cid){
 /* Pertinence d'un document face à la description que l'étudiant fait de son
    épreuve. Recherche locale, sans appel au modèle : instantanée, et surtout
    reproductible — deux lancements identiques donnent la même sélection. */
+const sansTexte = i => !!(i && (i.scan || /^\*\(Ce PDF est un scan/.test(String(i.contenu||""))));
+
 function motsUtiles(txt){
   const vides = new Set(("le la les de des du un une et ou a à au aux en dans sur pour par avec sans "
     + "ce cet cette ces son sa ses est sont être avoir que qui quoi dont où il elle on nous vous ils "
@@ -3411,11 +3521,11 @@ function scorePertinence(it, mots, titresThemes){
    barème. On les rassemble à part du contenu, et on privilégie celles qui
    parlent du sujet annoncé. */
 function annalesDe(mid, mots, titresThemes, maxChars){
-  let an = state.items.filter(i => i.type === "annale" && (!mid || i.matiereId === mid));
+  let an = state.items.filter(i => i.type === "annale" && !sansTexte(i) && (!mid || i.matiereId === mid));
   if(!an.length) return { texte:"", nb:0, titres:[] };
   an = an.map(i=>({ i, s: scorePertinence(i, mots, titresThemes) }))
-         .sort((a,b)=>b.s-a.s).slice(0,8).map(x=>x.i);
-  const budget = maxChars || 16000;
+         .sort((a,b)=>b.s-a.s).slice(0,12).map(x=>x.i);
+  const budget = maxChars || 22000;
   const part = Math.max(900, Math.floor(budget / an.length));
   let txt = "";
   an.forEach(i=>{
@@ -3497,7 +3607,7 @@ async function preparerEvaluation(mid, themes, opt){
   // Sélection : d'abord les thèmes cochés, sinon toute la matière, classés par
   // pertinence face à ce que l'étudiant a décrit.
   let candidats = state.items.filter(i=>{
-    if(i.type === "annale") return false;
+    if(i.type === "annale" || sansTexte(i)) return false;
     if(themes.length) return themes.indexOf(i.chapitreId) >= 0;
     return !mid || i.matiereId === mid;
   });
@@ -3564,7 +3674,17 @@ async function preparerEvaluation(mid, themes, opt){
         + "## Pièges et erreurs fréquentes\nD'après les corrigés présents dans les annales.\n"
         + "## Ce qui te manque\nSi la description de l'épreuve mentionne une notion absente des documents "
         + "fournis, dis-le franchement au lieu de l'inventer.\n\n"
-        + "Formules en LaTeX entre $…$, tableaux en markdown. Vérifie tes calculs avant d'écrire le corrigé." }],
+        + "RÈGLES D'EXACTITUDE — impératives, l'étudiant révise sur ce que tu écris :\n"
+        + "- Chaque affirmation sur la forme de l'épreuve cite entre crochets le sujet d'où elle vient : [Midterm 2021]. "
+        + "Sans source, ne l'affirme pas.\n"
+        + "- Distingue ce qui est CERTAIN (présent dans plusieurs annales), PROBABLE (une seule) et HYPOTHÈSE (aucune).\n"
+        + "- N'avance aucune définition, formule ou valeur absente des documents fournis ; si un complément est "
+        + "indispensable, marque-le « (complément hors cours) ».\n"
+        + "- Refais chaque calcul toi-même, y compris ceux des corrigés fournis. Si un corrigé du professeur contient "
+        + "une erreur, signale-la avec la valeur juste et le détail du calcul, au lieu de la reproduire.\n"
+        + "- Si les documents ne permettent pas de répondre, dis-le. Une préparation courte et juste vaut mieux "
+        + "qu'une préparation longue qui oriente mal.\n\n"
+        + "Formules en LaTeX entre $…$, tableaux en markdown." }],
       effort:"high", maxTokens: 20000, signal: ch.signal,
       onText: t=>{ const el = $("#liveOut"); if(el) el.textContent = t; }
     });
@@ -3845,6 +3965,7 @@ function ecranRangement(plan, mid){
       const f = fusions[i], abs = (f.absorber||[]).filter(valides);
       for(const a of abs){
         for(const it of itemsOf(a)){ it.chapitreId = f.garder; await saveItem(it); }
+        enterrer("chapitres", a);
         state.chapitres = state.chapitres.filter(c=>c.id !== a);
       }
       const g = chapById(f.garder); if(g && f.titre) g.titre = f.titre;
@@ -4844,7 +4965,7 @@ async function amorcer(){
   chargerConfig();
   chargerSupa();
   await loadAll(); loadPref(); majMode(); render();
-  rejoindreEnLigne();          // volontairement sans await : l'écran est déjà là
+  const premiereSync = synchroniser();   // sans await : l'écran est déjà là
 
   if(typeof claude !== "undefined" && claude && claude.use){
     try{ db = await claude.use("db"); }catch(e){}
@@ -4861,6 +4982,7 @@ async function amorcer(){
     majMode(); render();
   }
 
+  if(!state.matieres.length && supaActif()) await premiereSync;
   if(!state.matieres.length){ await amorcer(); render(); }
 })();
 
