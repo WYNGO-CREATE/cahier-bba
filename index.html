@@ -3436,7 +3436,7 @@ async function entrainerChapitre(cid){
   // Les sujets d'examen de la matière servent de gabarit : les exercices doivent
   // ressembler à ce qui tombe réellement, pas à un manuel générique.
   const titresTh = {}; state.chapitres.forEach(x=>{ titresTh[x.id] = x.titre; });
-  const anx = annalesDe(c.matiereId, motsUtiles(c.titre), titresTh, 9000);
+  const anx = annalesDe(c.matiereId, motsUtiles(c.titre), titresTh, 24000);
   const refAnnales = anx.nb
     ? "SUJETS D'EXAMEN DE LA MATIÈRE — inspire-toi de leur forme (type de questions, barème, niveau), "
       + "sans les recopier :\n" + anx.texte + "\n\n"
@@ -3533,7 +3533,9 @@ function annalesDe(mid, mots, titresThemes, maxChars){
   if(!an.length) return { texte:"", nb:0, titres:[] };
   an = an.map(i=>({ i, s: scorePertinence(i, mots, titresThemes) }))
          .sort((a,b)=>b.s-a.s).slice(0,12).map(x=>x.i);
-  const budget = maxChars || 22000;
+  // Budget large : les annales transcrites portent énoncé, barème et corrigé vérifié ;
+  // tronquer à ~1 800 caractères par sujet ne laissait voir que l'énoncé.
+  const budget = maxChars || 60000;
   const part = Math.max(900, Math.floor(budget / an.length));
   let txt = "";
   an.forEach(i=>{
