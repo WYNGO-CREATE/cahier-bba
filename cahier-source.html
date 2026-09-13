@@ -1,4 +1,6 @@
 <title>Cahier — Global BBA</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css">
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js"></script>
 <style>
   /* ============================================================
      CAHIER — direction visuelle
@@ -209,6 +211,10 @@
   .prose h1,.prose h2,.prose h3{font-family:var(--ui);font-weight:700;margin:1.3em 0 .45em;line-height:1.28}
   .prose h1{font-size:18px}.prose h2{font-size:16.5px}.prose h3{font-size:15px}
   .prose p{margin:.6em 0}
+  .prose .katex{font-size:1.07em}
+  .prose .katex-display,.prose .maths-bloc{overflow-x:auto;overflow-y:hidden;margin:.7em 0;padding:3px 0}
+  .prose .maths-bloc .katex-display{margin:0}
+  .apercu{background:var(--surface-2);border:1px solid var(--trait);border-radius:12px;padding:14px 16px;max-height:62vh;overflow:auto}
   .prose ul,.prose ol{margin:.55em 0;padding-left:1.3em}
   .prose li{margin:.28em 0}
   .prose code{font-family:var(--chiffres);font-size:.85em;background:var(--surface-3);
@@ -1236,12 +1242,39 @@ const itemsOfMat = mid => state.items.filter(i=>i.matiereId===mid);
 /* =========================================================
    2. MARKDOWN (rendu minimal, sûr)
    ========================================================= */
+/* Formules : KaTeX (chargé depuis cdnjs) les dessine comme dans un manuel.
+   Sans lui — hors ligne, ou formule mal écrite — on montre le LaTeX brut
+   plutôt que rien. */
+function rendreMaths(tex, bloc){
+  tex = String(tex || "").trim();
+  if(!tex) return "";
+  if(window.katex){
+    try{
+      return katex.renderToString(tex, { displayMode: !!bloc, throwOnError: true, strict: "ignore", output: "html" });
+    }catch(e){ /* formule invalide : on retombe sur le texte brut */ }
+  }
+  return bloc ? '<span class="maths-bloc"><code>'+esc(tex)+"</code></span>" : "<code>"+esc(tex)+"</code>";
+}
+
 function md(src){
   if(!src) return "";
   const lines = String(src).replace(/\r/g,"").split("\n");
   let out = [], i = 0, listType = null;
 
-  const inline = t => esc(t)
+  // Formules et code sont mis de côté AVANT l'échappement et la mise en forme :
+  // sinon « ** » ou « == » autour d'une formule, ou un « * » du LaTeX, cassent
+  // tout et l'étudiant ne lit plus qu'une suite de symboles.
+  const inline = t => { const gardes = [], garder = h => "\u0001" + (gardes.push(h) - 1) + "\u0002";
+    return esc(String(t == null ? "" : t)
+      // Surlignage ou gras posé autour d'une formule centrée : la formule suffit.
+      .replace(/(==|\*\*)\s*(\$\$[^$]+?\$\$)\s*\1/g, "$2")
+      .replace(/`([^`]+)`/g, (m,x)=>garder("<code>"+esc(x)+"</code>"))
+      .replace(/\$\$([^$]+?)\$\$/g, (m,x)=>garder(rendreMaths(x, true)))
+      .replace(/\\\[([\s\S]+?)\\\]/g, (m,x)=>garder(rendreMaths(x, true)))
+      .replace(/\\\(([\s\S]+?)\\\)/g, (m,x)=>garder(rendreMaths(x, false)))
+      // Formule mal délimitée par l'IA (« $ \geqslant x$ ») : une commande LaTeX suffit à la reconnaître.
+      .replace(/\$\s+(\\[A-Za-z][^$\n]*?)\s*\$(?!\d)/g, (m,x)=>garder(rendreMaths(x, false)))
+      .replace(/\$(?![\s$])([^$\n]*?[^\s$\\])\$(?!\d)/g, (m,x)=>garder(rendreMaths(x, false))))
     .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
       (m,txt,url)=>'<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+txt+"</a>")
     // Marques relevées sur une page manuscrite : elles doivent se distinguer
@@ -1253,17 +1286,32 @@ function md(src){
       (m,x)=>'<span class="vu-marque">'+x+"</span>")
     .replace(/\[illisible\]/gi, '<span class="vu-doute">illisible</span>')
     .replace(/(\S+)\[\?\]/g, (m,mot)=>'<span class="vu-doute" title="lecture incertaine">'+mot+"</span>")
-    .replace(/\$\$([^$]+)\$\$/g, (m,x)=>"<code>"+x.trim()+"</code>")
-    .replace(/\$([^$\n]+)\$/g, (m,x)=>"<code>"+x.trim()+"</code>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
-    .replace(/==([^=]+)==/g, "<mark>$1</mark>");
+    .replace(/==([^=]+)==/g, "<mark>$1</mark>")
+    .replace(/\u0001(\d+)\u0002/g, (m,n)=>gardes[+n]); };
 
   const closeList = ()=>{ if(listType){ out.push("</"+listType+">"); listType=null; } };
 
   while(i < lines.length){
     const l = lines[i];
+
+    // Formule sur plusieurs lignes : $$ (ou \[) ouvert sans être refermé sur la même ligne.
+    const ouvre = l.trim().match(/^(\$\$|\\\[)(.*)$/);
+    if(ouvre && (ouvre[1] === "$$" ? ouvre[2].indexOf("$$") < 0 : ouvre[2].indexOf("\\]") < 0)){
+      const ferme = ouvre[1] === "$$" ? "$$" : "\\]";
+      const buf = [ouvre[2]]; let j = i + 1;
+      while(j < lines.length && lines[j].indexOf(ferme) < 0) buf.push(lines[j++]);
+      if(j < lines.length){
+        closeList();
+        const k = lines[j].indexOf(ferme);
+        buf.push(lines[j].slice(0, k));
+        out.push('<div class="maths-bloc">' + rendreMaths(buf.join("\n"), true) + "</div>");
+        const reste = lines[j].slice(k + ferme.length).trim();
+        if(reste) out.push("<p>" + inline(reste) + "</p>");
+        i = j + 1; continue;
+      }
+    }
 
     if(/^```/.test(l)){
       closeList(); const buf=[]; i++;
@@ -1495,6 +1543,21 @@ const REGLE_THEME =
   + "l'étudiant à retrouver sa séance — jamais dans le nom du thème.\n"
   + "Ne propose aucun numéro de chapitre : la numérotation appartient à l'étudiant.";
 
+/* Une seule règle d'écriture des formules, partagée par la lecture des photos
+   et la mise au propre : un cours de maths ou de macro doit se relire comme
+   dans un manuel, pas comme du code. md() dessine le LaTeX avec KaTeX. */
+const REGLES_MATHS = "\nFORMULES, CHIFFRES ET CALCULS — le rendu doit se lire comme dans un manuel\n"
+  + "- Toute expression mathématique s'écrit en LaTeX : $…$ à l'intérieur d'une phrase, $$…$$ SEULE sur sa ligne pour une formule posée à part.\n"
+  + "- Jamais de mise en forme autour ou à l'intérieur d'une formule : ni ==$…$==, ni **$…$**, ni formule $$…$$ dans une liste à puces. "
+  + "Si la formule est surlignée ou encadrée sur la page, mets la marque sur la ligne juste avant (« **Formule à retenir** [encadré] »), puis la formule seule sur la ligne suivante.\n"
+  + "- Les nombres ordinaires restent du texte, avec une espace pour les milliers : 1 000 000 ; 125 000 € ; 3,5 %. Pas de LaTeX pour un simple nombre, jamais de \\, pour séparer les milliers.\n"
+  + "- LaTeX standard et simple : \\frac{a}{b}, x^{2}, u_{n}, \\times, \\cdot, \\leq, \\geq, \\neq, \\approx, \\sqrt{x}, \\sum, \\Delta, \\alpha, \\to. "
+  + "Pas d'environnement (align, array, cases), pas de macro personnelle : une équation par ligne.\n"
+  + "- Un calcul en plusieurs étapes : une étape par ligne, chacune entre $$…$$, dans l'ordre de la page.\n"
+  + "- Chaque accolade ouverte se referme : relis chaque formule avant de répondre.\n"
+  + "- Recopie chaque chiffre, signe, indice et exposant exactement comme sur la page. Ne calcule rien, ne corrige aucun résultat, n'ajoute aucune étape. "
+  + "Un symbole douteux est suivi de [?].\n";
+
 function consigneVision(contexte){
   return "Tu lis une page de cours d'un étudiant : notes manuscrites, polycopié annoté, "
     + "photo d'un tableau ou d'une diapositive.\n"
@@ -1505,7 +1568,8 @@ function consigneVision(contexte){
     + "Si l'image contient deux pages côte à côte — cas courant d'un scan de livret — traite d'abord la page de "
     + "gauche en entier, puis celle de droite, et sépare-les par une ligne « --- ». "
     + "Si la page est pivotée ou à l'envers, lis-la quand même dans le bon sens. "
-    + "Conserve la numérotation du cours (I, A, 1., a)). Formules en LaTeX entre $…$, tableaux en markdown.\n"
+    + "Conserve la numérotation du cours (I, A, 1., a)). Tableaux en markdown.\n"
+    + REGLES_MATHS
     + "\nRESTITUE LES ANNOTATIONS — c'est le plus important\n"
     + "Une marque manuscrite est un jugement du professeur ou de l'étudiant sur l'importance. Rends-la :\n"
     + "- surligné → ==texte surligné== ; précise la couleur si plusieurs sont utilisées : ==texte== [surligné en jaune]\n"
@@ -1865,8 +1929,15 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
   });
 
   if(!res.ok){
-    let msg = "";
-    try{ const j = await res.json(); msg = (j.error && j.error.message) || ""; }catch(e){}
+    let msg = "", attente = 0, quotaJour = false;
+    try{
+      const j = await res.json(); msg = (j.error && j.error.message) || "";
+      const details = (j.error && j.error.details) || [];
+      const ri = details.find(d=>/RetryInfo/.test((d && d["@type"]) || ""));
+      if(ri && ri.retryDelay) attente = parseFloat(ri.retryDelay) || 0;
+      quotaJour = /PerDay|per day/i.test(JSON.stringify(details) + " " + msg);
+    }catch(e){}
+    if(!attente){ const mm = /retry in ([\d.]+)\s*s/i.exec(msg); if(mm) attente = parseFloat(mm[1]) || 0; }
     if(/denied access|CONSUMER_INVALID|PERMISSION_DENIED/i.test(msg))
       msg += " — le compte Google lui-même est bloqué, pas la clé. Causes habituelles : compte scolaire ou professionnel dont l'administrateur interdit AI Studio, "
            + "ou compte personnel sans date de naissance renseignée / déclaré mineur. Réessaie avec un compte Gmail personnel majeur, "
@@ -1895,6 +1966,7 @@ async function appelGeminiBrut({ system, messages, images, maxTokens, schema, on
              : res.status === 403 ? "cle_invalide"
              : res.status === 429 ? "rate_limited"
              : res.status >= 500 ? "upstream_error" : "api_error";
+    err.attente = attente; err.quotaJour = quotaJour;
     throw err;
   }
 
@@ -2071,30 +2143,34 @@ const dodo = ms => new Promise(r=>setTimeout(r, ms));
 const estPassager = c => c === "upstream_error" || c === "rate_limited";
 
 async function avecReprises(faire){
-  const attentes = [0, 2000, 5000];
+  const attentes = [0, 4000, 12000, 30000];
   let derniere;
   for(let i = 0; i < attentes.length; i++){
-    if(attentes[i]){
-      toast("Service saturé — nouvelle tentative dans " + (attentes[i]/1000) + " s", attentes[i]);
-      await dodo(attentes[i]);
+    if(i){
+      // Google indique souvent lui-même combien de temps patienter : on s'y tient.
+      const conseil = derniere && derniere.attente ? Math.min(60000, Math.round(derniere.attente * 1000) + 500) : 0;
+      const ms = Math.max(attentes[i], conseil);
+      toast("Service d'IA saturé (Google, pas ton cahier) — nouvel essai dans " + Math.round(ms/1000) + " s. Ne ferme rien.", ms);
+      await dodo(ms);
     }
     try{ return await faire(); }
     catch(brut){
       const e = normErreur(brut);
       derniere = e;
       if(!estPassager(e && e.code)) throw e;   // une annulation ne se réessaie jamais
+      if(e.quotaJour) break;                   // quota du jour épuisé : attendre ne sert à rien
     }
   }
-  // Toujours saturé : un autre modèle est peut-être disponible.
+  // Toujours saturé : chaque modèle a son propre quota, on essaie les suivants.
   try{
-    const suivant = classerModeles(await listerModeles()).find(n => n !== IA.modele);
-    if(suivant){
-      const avant = IA.modele;
-      toast("Bascule sur " + suivant, 3000);
+    const avant = IA.modele;
+    const autres = classerModeles(await listerModeles()).filter(n => n !== avant).slice(0, 3);
+    for(const suivant of autres){
+      toast("Modèle saturé — essai avec " + suivant, 3000);
       enregistrerConfig({ modele: suivant });
-      try{ return await faire(); }
-      catch(e2){ enregistrerConfig({ modele: avant }); }
+      try{ return await faire(); }catch(e2){ /* on essaie le suivant */ }
     }
+    enregistrerConfig({ modele: avant });
   }catch(e3){ /* on retombe sur l'erreur d'origine, plus parlante */ }
   throw derniere;
 }
@@ -2315,7 +2391,9 @@ function msgErreur(e){
   if(c==="modele_inconnu") return "Aucun modèle utilisable trouvé pour cette clé. Vérifie qu'elle est bien active sur " + FOURNISSEURS[IA.fournisseur].lienCle + ".";
   if(c==="api_error") return "L'API a refusé la requête" + (e.message ? " : "+e.message : ".");
   if(c==="not_granted" || c==="sampling_disabled") return "L'assistant n'est pas configuré — voir ⚙ Réglages.";
-  if(c==="rate_limited") return "Trop de demandes d'affilée — réessaie dans quelques minutes.";
+  if(c==="rate_limited") return e.quotaJour
+    ? "Quota gratuit de Google épuisé pour aujourd'hui sur ce modèle — choisis un autre modèle dans ⚙ Réglages, ou réessaie demain. Ton texte est gardé."
+    : "Service d'IA saturé (le problème vient de Google, pas de ton cahier) — réessaie dans une minute. Ton texte est gardé.";
   if(c==="prompt_too_large") return "Le chapitre est trop long à envoyer d'un coup. Analyse-le en deux chapitres.";
   if(c==="invalid_json") return "Réponse mal formée. Relance l'analyse.";
   if(c==="image_rejected") return "Image refusée : format non supporté ou fichier trop lourd.";
@@ -2468,10 +2546,10 @@ function openEditor(opts){
     + '<div class="grid2">'
     +   '<div><label class="lab" for="eM">Matière</label><select class="field" id="eM">'
     +     state.matieres.map(m=>'<option value="'+m.id+'"'+(m.id===mid?" selected":"")+">"+esc(m.nom)+"</option>").join("")+"</select></div>"
-    +   '<div><label class="lab" for="eC">Chapitre</label><select class="field" id="eC"></select></div>'
+    +   '<div><label class="lab" for="eC">Ranger dans le thème</label><select class="field" id="eC"></select></div>'
     + "</div>"
-    + '<div id="newChapWrap" class="hide"><label class="lab" for="eNC">Titre du nouveau chapitre</label>'
-    +   '<input class="field" id="eNC" placeholder="Ex. Chapitre 3 — Les amortissements"></div>'
+    + '<div id="newChapWrap" class="hide"><label class="lab" for="eNC">Nom du nouveau thème</label>'
+    +   '<input class="field" id="eNC" placeholder="Ex. Loi de Pareto — vide : le titre du cours sera utilisé"></div>'
     + '<div><label class="lab">Type de document</label><div class="seg" id="eT">'
     +   Object.keys(TYPES).map(k=>'<button type="button" data-t="'+k+'" aria-pressed="'+((it?it.type:"cours")===k)+'">'+TYPES[k]+"</button>").join("")+"</div></div>"
     + '<div><label class="lab" for="eTi">Titre</label><input class="field" id="eTi" value="'+esc(it?it.titre:"")+'" placeholder="Séance du 12 septembre — Introduction"></div>'
@@ -2481,7 +2559,10 @@ function openEditor(opts){
     +     '<span class="note" id="ePhotoEtat"></span>'
     +     '<input type="file" id="ePhotoIn" multiple accept="image/*" class="sr">'
     +   "</div>"
+    +   '<div class="seg" id="eVue" style="margin:8px 0 6px"><button type="button" data-v="texte" aria-pressed="true">✎ Texte</button>'
+    +     '<button type="button" data-v="apercu" aria-pressed="false">◉ Aperçu lisible</button></div>'
     +   '<textarea class="field" id="eB" rows="14" style="font-size:13.5px">'+esc(it?it.contenu:"")+"</textarea>"
+    +   '<div class="prose apercu hide" id="eApercu"></div>' 
     +   '<p class="note" style="margin-top:6px">La photo est lue puis retranscrite <b>à l\'endroit du curseur</b>. '
     +   "Sélectionne plusieurs photos : elles sont insérées l'une après l'autre, dans l'ordre où tu les choisis.</p></div>"
     + "</div></div>"
@@ -2494,7 +2575,7 @@ function openEditor(opts){
   function fillChaps(){
     const list = chapsOf(selM.value);
     selC.innerHTML = list.map(c=>'<option value="'+c.id+'"'+(c.id===cid?" selected":"")+">Ch. "+esc(c.numero||"?")+" — "+esc(c.titre)+"</option>").join("")
-      + '<option value="__new">+ Nouveau chapitre</option>';
+      + '<option value="__new">+ Nouveau thème</option>';
     if(!list.length) selC.value = "__new";
     toggleNew();
   }
@@ -2505,7 +2586,46 @@ function openEditor(opts){
     type = b.dataset.t;
     document.querySelectorAll("#eT [data-t]").forEach(x=>x.setAttribute("aria-pressed", String(x.dataset.t===type)));
   });
-  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=closeModal);
+  /* ----- texte brut / aperçu lisible ----- */
+  const zone = $("#eB"), apercu = $("#eApercu");
+  function montrer(v){
+    const lisible = v === "apercu";
+    if(lisible) apercu.innerHTML = zone.value.trim() ? md(zone.value) : '<p class="note">Rien à afficher pour l\'instant.</p>';
+    zone.classList.toggle("hide", lisible); apercu.classList.toggle("hide", !lisible);
+    document.querySelectorAll("#eVue [data-v]").forEach(b=>b.setAttribute("aria-pressed", String(b.dataset.v === v)));
+  }
+  document.querySelectorAll("#eVue [data-v]").forEach(b=>b.onclick=()=>montrer(b.dataset.v));
+
+  /* ----- brouillon : un cours en cours d'écriture ne se perd jamais ----- */
+  const CLE_BROUILLON = LS_KEY + "-brouillon" + (it ? "-" + it.id : "");
+  const contenuInitial = it ? it.contenu : "";
+  try{
+    const b0 = JSON.parse(localStorage.getItem(CLE_BROUILLON) || "null");
+    if(b0 && b0.contenu && b0.contenu.trim() && b0.contenu !== contenuInitial){
+      zone.value = b0.contenu;
+      if(b0.titre && !$("#eTi").value) $("#eTi").value = b0.titre;
+      $("#edState").textContent = "Brouillon non enregistré restauré";
+    }
+  }catch(e){}
+  let minuterieBrouillon = null;
+  const ecrireBrouillon = ()=>{
+    try{
+      if(zone.value.trim()) localStorage.setItem(CLE_BROUILLON,
+        JSON.stringify({ contenu: zone.value, titre: $("#eTi").value, date: new Date().toISOString() }));
+    }catch(e){}
+  };
+  const garderBrouillon = ()=>{ clearTimeout(minuterieBrouillon); minuterieBrouillon = setTimeout(ecrireBrouillon, 600); };
+  const oublierBrouillon = ()=>{ clearTimeout(minuterieBrouillon); try{ localStorage.removeItem(CLE_BROUILLON); }catch(e){} };
+  zone.addEventListener("input", garderBrouillon); $("#eTi").addEventListener("input", garderBrouillon);
+
+  document.querySelectorAll("[data-x]").forEach(b=>b.onclick=()=>{
+    const modifie = zone.value.trim() && zone.value !== contenuInitial;
+    if(modifie){
+      if(!confirm("Fermer sans enregistrer ?\n\nTon texte est gardé en brouillon : il reviendra à la prochaine ouverture de « Écrire un cours ».")) return;
+      clearTimeout(minuterieBrouillon); ecrireBrouillon();
+    }
+    closeModal();
+  });
   $(it ? "#eB" : "#eTi").focus();
 
   /* ----- insertion d'une photo au fil de la frappe -----
@@ -2531,7 +2651,7 @@ function openEditor(opts){
     let pos = ta.selectionStart != null ? ta.selectionStart : ta.value.length;
 
     for(let i = 0; i < photos.length; i++){
-      const ch = chantier(etat, "Photo " + (i+1) + "/" + photos.length, { delai: 120000 });
+      const ch = chantier(etat, "Photo " + (i+1) + "/" + photos.length, { delai: 240000 });
       try{
         // La fin de ce qui précède est transmise : elle permet de reconnaître
         // une phrase coupée en bas de page et de reprendre le fil sans doublon.
@@ -2567,10 +2687,11 @@ function openEditor(opts){
       }
     }
 
-    etat.textContent = photos.length > 1
+    etat.textContent = (photos.length > 1
       ? photos.length + " photos insérées dans l'ordre"
-      : "Photo insérée";
+      : "Photo insérée") + " — affichée en aperçu lisible";
     btn.disabled = false;
+    garderBrouillon(); montrer("apercu");
   };
 
   $("#eClean").onclick = async ()=>{
@@ -2585,11 +2706,16 @@ function openEditor(opts){
           "Voici des notes de cours prises à la volée. Remets-les au propre en markdown : titres (##), sous-titres (###), listes, "
           + "**gras** sur les définitions, ==surlignage== sur ce qui est à retenir par cœur. "
           + "Corrige l'orthographe et les abréviations évidentes. N'ajoute AUCUN contenu qui n'est pas dans les notes ; "
-          + "si un passage est incompréhensible, laisse-le et marque-le `[à vérifier]`. Réponds seulement avec les notes mises au propre.\n\n"
+          + "si un passage est incompréhensible, laisse-le et marque-le `[à vérifier]`.\n"
+          + REGLES_MATHS
+          + "Formules déjà présentes : garde-les, et réécris celles qui enfreignent ces règles (formule surlignée ou en gras, "
+          + "nombre écrit en LaTeX, accolade manquante) sans jamais en changer le sens.\n"
+          + "Réponds seulement avec les notes mises au propre.\n\n"
           + brut.slice(0,26000) }],
         effort: "medium", maxTokens: 16000
       });
       $("#eB").value = texte; $("#edState").textContent = "Mis au propre";
+      garderBrouillon(); montrer("apercu");
       if(!$("#eTi").value.trim()){
         const h = texte.split("\n").find(l=>/^#{1,3}\s/.test(l));
         if(h) $("#eTi").value = h.replace(/^#+\s*/,"").trim();
@@ -2603,8 +2729,9 @@ function openEditor(opts){
     if(!contenu){ toast("Le contenu est vide"); return; }
     let chapId = selC.value;
     if(chapId==="__new"){
-      const t = $("#eNC").value.trim();
-      if(!t){ toast("Donne un titre au nouveau chapitre"); return; }
+      // Sans nom de thème, on ne bloque pas l'enregistrement : le cours se range
+      // sous son propre titre, que l'étudiant renommera s'il le souhaite.
+      const t = $("#eNC").value.trim() || $("#eTi").value.trim() || "À classer";
       const num = chapsOf(selM.value).reduce((n,x)=>Math.max(n,Number(x.numero)||0),0)+1;
       const nc = { id:uid(), matiereId:selM.value, titre:t, numero:num, statut:"encours", note:"" };
       state.chapitres.push(nc); chapId = nc.id; await saveStructure();
@@ -2613,6 +2740,7 @@ function openEditor(opts){
     const titre = $("#eTi").value.trim()
       || (TYPES[type] + " — " + maintenant.toLocaleDateString("fr-FR", { day:"2-digit", month:"2-digit" })
           + " à " + maintenant.toLocaleTimeString("fr-FR", { hour:"2-digit", minute:"2-digit" }));
+    let idDoc = it ? it.id : null;
     if(it){
       it.titre=titre; it.contenu=contenu; it.type=type; it.matiereId=selM.value; it.chapitreId=chapId;
       it.maj = maintenant.toISOString();
@@ -2620,10 +2748,16 @@ function openEditor(opts){
     }else{
       const nit = { id:uid(), matiereId:selM.value, chapitreId:chapId, type, titre, contenu,
         source:"texte", date: maintenant.toISOString() };
-      state.items.push(nit); await saveItem(nit); state.openDocs.add(nit.id);
+      state.items.push(nit); await saveItem(nit); idDoc = nit.id;
     }
-    state.selMat = selM.value; state.openChaps.add(chapId);
-    closeModal(); render(); toast("Enregistré");
+    oublierBrouillon();
+    state.openChaps.add(chapId); state.openDocs.add(idDoc);
+    closeModal();
+    // On emmène l'étudiant là où le cours est rangé : sinon il croit l'avoir perdu.
+    aller("chapitre", { mat: selM.value, chap: chapId });
+    const chR = chapById(chapId), mR = matById(selM.value);
+    toast("Enregistré dans " + (mR ? mR.nom : "") + " › " + (chR ? chR.titre : ""), 4500);
+    setTimeout(()=>{ const el = document.querySelector('[data-doc="'+idDoc+'"]'); if(el) el.scrollIntoView({ block:"start", behavior:"smooth" }); }, 80);
   };
 }
 
@@ -4969,6 +5103,9 @@ async function amorcer(){
   state.selMat = state.matieres[0].id;
   await saveStructure();
 }
+
+// KaTeX arrive après le premier affichage (script différé) : on redessine une fois.
+window.addEventListener("load", ()=>{ if(window.katex){ try{ render(); }catch(e){} } });
 
 (async function boot(){
   const th = (()=>{ try{ return localStorage.getItem(LS_KEY+"-theme") || "auto"; }catch(e){ return "auto"; } })();
