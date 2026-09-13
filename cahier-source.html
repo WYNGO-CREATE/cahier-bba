@@ -630,30 +630,40 @@ function assainir(x){
 
 async function supaRPC(fonction, args){
   args = assainir(args);
-  // Un serveur injoignable ne doit jamais faire attendre : sans cette borne,
-  // une adresse de projet erronée laissait la page blanche indéfiniment.
+  const corps = JSON.stringify(args);
+  // Une borne reste nécessaire (un serveur injoignable ne doit pas bloquer la
+  // synchronisation), mais elle doit couvrir le TRANSFERT : le cahier pèse
+  // plusieurs Mo depuis la transcription des scans, et 10 s ne suffisaient pas
+  // pour l'envoyer ou le recevoir sur une connexion de téléphone. L'affichage,
+  // lui, n'attend jamais le réseau (voir loadAll).
+  const delai = Math.min(180000, Math.max(60000, 20000 + Math.round(corps.length / 40)));
   const ctl = new AbortController();
-  const minuteur = setTimeout(()=>ctl.abort(), 10000);
-  let r;
+  const minuteur = setTimeout(()=>ctl.abort(), delai);
+  let r, donnees;
   try{
     r = await fetch(SUPA.url.replace(/\/+$/,"") + "/rest/v1/rpc/" + fonction, {
       method:"POST", signal: ctl.signal,
       headers:{ "apikey":SUPA.cle, "Authorization":"Bearer "+SUPA.cle, "Content-Type":"application/json" },
-      body: JSON.stringify(args)
+      body: corps
     });
+    if(!r.ok){
+      const t = await r.text().catch(()=>"" );
+      let aide = "";
+      if(r.status === 404) aide = " — le SQL n'a pas été exécuté, ou pas dans ce projet.";
+      else if(r.status === 401 || r.status === 403) aide = " — la clé ne correspond pas à ce projet.";
+      else if(r.status === 405) aide = " — l'adresse du projet semble incorrecte.";
+      throw Object.assign(new Error("HTTP " + r.status + aide + (t ? " " + t.slice(0,140) : "")), { http:true });
+    }
+    // La lecture du corps fait partie du transfert : elle reste sous la même borne.
+    const texte = await r.text();
+    donnees = texte ? JSON.parse(texte) : null;
   }catch(e){
-    throw new Error(e && e.name === "AbortError" ? "le serveur n'a pas répondu en 10 secondes"
-                                                 : "serveur injoignable");
+    if(e && e.http) throw e;
+    throw new Error(e && e.name === "AbortError"
+      ? "connexion trop lente : transfert non terminé en " + Math.round(delai/1000) + " secondes, nouvel essai automatique"
+      : (e instanceof SyntaxError ? "réponse du serveur incomplète, nouvel essai automatique" : "serveur injoignable"));
   }finally{ clearTimeout(minuteur); }
-  if(!r.ok){
-    const t = await r.text().catch(()=>"" );
-    let aide = "";
-    if(r.status === 404) aide = " — le SQL n'a pas été exécuté, ou pas dans ce projet.";
-    else if(r.status === 401 || r.status === 403) aide = " — la clé ne correspond pas à ce projet.";
-    else if(r.status === 405) aide = " — l'adresse du projet semble incorrecte.";
-    throw new Error("HTTP " + r.status + aide + (t ? " " + t.slice(0,140) : ""));
-  }
-  return r.json().catch(()=>null);
+  return donnees;
 }
 
 async function supaLire(){
